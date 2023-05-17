@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 import torch
-from dataset.range_transform import inv_im_trans
+from xmem.dataset.range_transform import inv_im_trans
 from collections import defaultdict
 
 def tensor_to_numpy(image):

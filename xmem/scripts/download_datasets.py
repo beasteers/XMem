@@ -1,7 +1,7 @@
 import os
 import gdown
 import zipfile
-from scripts import resize_youtube
+from xmem.scripts import resize_youtube
 
 
 LICENSE = """

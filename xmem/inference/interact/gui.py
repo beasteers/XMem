@@ -29,9 +29,9 @@ from PyQt5.QtWidgets import (QWidget, QApplication, QComboBox, QCheckBox,
 from PyQt5.QtGui import QPixmap, QKeySequence, QImage, QTextCursor, QIcon
 from PyQt5.QtCore import Qt, QTimer
 
-from model.network import XMem
+from xmem.model.network import XMem
 
-from inference.inference_core import InferenceCore
+from xmem.inference.inference_core import InferenceCore
 from .s2m_controller import S2MController
 from .fbrs_controller import FBRSController
 

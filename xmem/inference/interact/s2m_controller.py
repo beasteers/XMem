@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from ..interact.s2m.s2m_network import deeplabv3plus_resnet50 as S2M
 
-from util.tensor_util import pad_divide_by, unpad
+from xmem.util.tensor_util import pad_divide_by, unpad
 
 
 class S2MController:
