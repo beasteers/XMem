@@ -1,6 +1,8 @@
 import torch
 from typing import List
 
+
+
 class KeyValueMemoryStore:
     """
     Works for key/value pairs type storage
@@ -16,87 +18,84 @@ class KeyValueMemoryStore:
     """
 
     def __init__(self, count_usage: bool):
-        self.count_usage = count_usage
 
         # keys are stored in a single tensor and are shared between groups/objects
-        # values are stored as a list indexed by object groups
+        # values are stored as a dict indexed by object ids
         self.k = None
-        self.v = []
-        self.obj_groups = []
-        # for debugging only
-        self.all_objects = []
+        self.values = {}
 
         # shrinkage and selection are also single tensors
-        self.s = self.e = None
+        self.shrinkage = self.selection = None
 
         # usage
-        if self.count_usage:
-            self.use_count = self.life_count = None
+        self.count_usage = count_usage
+        # self.use_count = self.life_count = None
+        self.use_counts = {}
+        self.life_counts = {}
+
+    def __str__(self) -> str:
+        nk = tuple(self.k.shape) if self.k is not None else '-'
+        return f'Memory(key: {nk}, {len(self.values)} values)'
 
     def add(self, key, value, shrinkage, selection, objects: List[int]):
+        # key: [1, C, N]
+        # value: [num_objects, C, N]
+        # shrinkage: [?, ?, N]
+        # selection: [?, ?, N]
+        # new_count: [1, 1, N]
+        # new_life: [1, 1, N]
+        # objects - object ids - otherwise assume value is sorted by object ID
         new_count = torch.zeros((key.shape[0], 1, key.shape[2]), device=key.device, dtype=torch.float32)
         new_life = torch.zeros((key.shape[0], 1, key.shape[2]), device=key.device, dtype=torch.float32) + 1e-7
 
         # add the key
-        if self.k is None:
-            self.k = key
-            self.s = shrinkage
-            self.e = selection
+        self.k = maybe_cat(self.k, key)
+        self.shrinkage = maybe_cat(self.shrinkage, shrinkage)
+        self.selection = maybe_cat(self.selection, selection)
+
+        # add one value per object
+        if not isinstance(value, dict):
+            value = dict(zip(objects, value[:, None]))
+        for gi in set(self.values) | set(value):
+            gv = value[gi]
+            self.values[gi] = maybe_cat(self.values.get(gi), gv)
             if self.count_usage:
-                self.use_count = new_count
-                self.life_count = new_life
-        else:
-            self.k = torch.cat([self.k, key], -1)
-            if shrinkage is not None:
-                self.s = torch.cat([self.s, shrinkage], -1)
-            if selection is not None:
-                self.e = torch.cat([self.e, selection], -1)
+                self.use_counts[gi] = maybe_cat(self.use_counts.get(gi), new_count)
+                self.life_counts[gi] = maybe_cat(self.life_counts.get(gi), new_life)
+
+    def delete(self, i):
+        if i in self.values:
+            del self.values[i]
             if self.count_usage:
-                self.use_count = torch.cat([self.use_count, new_count], -1)
-                self.life_count = torch.cat([self.life_count, new_life], -1)
+                del self.use_counts[i]
+                del self.life_counts[i]
 
-        # add the value
-        if objects is not None:
-            # When objects is given, v is a tensor; used in working memory
-            assert isinstance(value, torch.Tensor)
-            # First consume objects that are already in the memory bank
-            # cannot use set here because we need to preserve order
-            # shift by one as background is not part of value
-            remaining_objects = [obj-1 for obj in objects]
-            for gi, group in enumerate(self.obj_groups):
-                for obj in group:
-                    # should properly raise an error if there are overlaps in obj_groups
-                    remaining_objects.remove(obj)
-                self.v[gi] = torch.cat([self.v[gi], value[group]], -1)
-
-            # If there are remaining objects, add them as a new group
-            if len(remaining_objects) > 0:
-                new_group = list(remaining_objects)
-                self.v.append(value[new_group])
-                self.obj_groups.append(new_group)
-                self.all_objects.extend(new_group)
-                
-                assert sorted(self.all_objects) == self.all_objects, 'Objects MUST be inserted in sorted order '
-        else:
-            # When objects is not given, v is a list that already has the object groups sorted
-            # used in long-term memory
-            assert isinstance(value, list)
-            for gi, gv in enumerate(value):
-                if gv is None:
-                    continue
-                if gi < self.num_groups:
-                    self.v[gi] = torch.cat([self.v[gi], gv], -1)
-                else:
-                    self.v.append(gv)
-
-    def update_usage(self, usage):
+    def update_usage(self, usages):
         # increase all life count by 1
         # increase use of indexed elements
         if not self.count_usage:
-            return
+            return 
         
-        self.use_count += usage.view_as(self.use_count)
-        self.life_count += 1
+        for gi, usage in usages.items():
+            if not len(usage):
+                continue
+            self.use_counts[gi][:, :, -usage.shape[-1]:] += usage[-self.use_counts[gi].shape[-1]:]
+            self.life_counts[gi][:, :, -usage.shape[-1]:] += 1
+
+    def get_usage(self):
+        # return normalized usage
+        if not self.count_usage:
+            raise RuntimeError('I did not count usage! ;o;')
+        # return self.use_count / self.life_count
+        u = max(self.use_counts.values(), key=lambda x: x.shape[-1])
+        shape = u.shape
+        usage = torch.zeros(shape, device=u.get_device())
+        counts = torch.zeros_like(usage)
+        for object_id in self.use_counts:
+            u = self.use_counts[object_id] / self.life_counts[object_id]
+            usage[:, :, -u.shape[-1]:] += u
+            counts[:, :, -u.shape[-1]:] += 1
+        return usage / counts
 
     def sieve_by_range(self, start: int, end: int, min_size: int):
         # keep only the elements *outside* of this range (with some boundary conditions)
@@ -104,112 +103,68 @@ class KeyValueMemoryStore:
         # min_size is only used for values, we do not sieve values under this size
         # (because they are not consolidated)
 
-        if end == 0:
-            # negative 0 would not work as the end index!
-            self.k = self.k[:,:,:start]
+        self.k = splice(self.k, start, end)
+        self.shrinkage = splice(self.shrinkage, start, end)
+        self.selection = splice(self.selection, start, end)
+        # self.use_count = slice_outside(self.use_count, start, end)
+        # self.life_count = slice_outside(self.life_count, start, end)
+
+        for gi, gv in self.values.items():
+            self.values[gi] = splice(gv, start, end)
             if self.count_usage:
-                self.use_count = self.use_count[:,:,:start]
-                self.life_count = self.life_count[:,:,:start]
-            if self.s is not None:
-                self.s = self.s[:,:,:start]
-            if self.e is not None:
-                self.e = self.e[:,:,:start]
-            
-            for gi in range(self.num_groups):
-                if self.v[gi].shape[-1] >= min_size:
-                    self.v[gi] = self.v[gi][:,:,:start]
-        else:
-            self.k = torch.cat([self.k[:,:,:start], self.k[:,:,end:]], -1)
-            if self.count_usage:
-                self.use_count = torch.cat([self.use_count[:,:,:start], self.use_count[:,:,end:]], -1)
-                self.life_count = torch.cat([self.life_count[:,:,:start], self.life_count[:,:,end:]], -1)
-            if self.s is not None:
-                self.s = torch.cat([self.s[:,:,:start], self.s[:,:,end:]], -1)
-            if self.e is not None:
-                self.e = torch.cat([self.e[:,:,:start], self.e[:,:,end:]], -1)
-            
-            for gi in range(self.num_groups):
-                if self.v[gi].shape[-1] >= min_size:
-                    self.v[gi] = torch.cat([self.v[gi][:,:,:start], self.v[gi][:,:,end:]], -1)
+                self.use_counts[gi] = splice(self.use_counts[gi], start, end)
+                self.life_counts[gi] = splice(self.life_counts[gi], start, end)
 
     def remove_obsolete_features(self, max_size: int):
-        # normalize with life duration
+        # get topk usage
         usage = self.get_usage().flatten()
-
         values, _ = torch.topk(usage, k=(self.size-max_size), largest=False, sorted=True)
         survived = (usage > values[-1])
 
+        # filter all using topk usage
         self.k = self.k[:, :, survived]
-        self.s = self.s[:, :, survived] if self.s is not None else None
+        self.shrinkage = self.shrinkage[:, :, survived] if self.shrinkage is not None else None
         # Long-term memory does not store ek so this should not be needed
-        self.e = self.e[:, :, survived] if self.e is not None else None
-        if self.num_groups > 1:
-            raise NotImplementedError("""The current data structure does not support feature removal with 
-            multiple object groups (e.g., some objects start to appear later in the video)
-            The indices for "survived" is based on keys but not all values are present for every key
-            Basically we need to remap the indices for keys to values
-            """)
-        for gi in range(self.num_groups):
-            self.v[gi] = self.v[gi][:, :, survived]
+        self.selection = self.selection[:, :, survived] if self.selection is not None else None
 
-        self.use_count = self.use_count[:, :, survived]
-        self.life_count = self.life_count[:, :, survived]
-
-    def get_usage(self):
-        # return normalized usage
-        if not self.count_usage:
-            raise RuntimeError('I did not count usage!')
-        else:
-            usage = self.use_count / self.life_count
-            return usage
+        for gi in self.values:
+            s = survived[-self.values[gi].shape[-1]:]
+            self.values[gi] = self.values[gi][:, :, s]
+            if self.count_usage:
+                self.use_counts[gi] = self.use_counts[gi][:, :, s]
+                self.life_counts[gi] = self.life_counts[gi][:, :, s]
 
     def get_all_sliced(self, start: int, end: int):
         # return k, sk, ek, usage in order, sliced by start and end
-
-        if end == 0:
-            # negative 0 would not work as the end index!
-            k = self.k[:,:,start:]
-            sk = self.s[:,:,start:] if self.s is not None else None
-            ek = self.e[:,:,start:] if self.e is not None else None
-            usage = self.get_usage()[:,:,start:]
-        else:
-            k = self.k[:,:,start:end]
-            sk = self.s[:,:,start:end] if self.s is not None else None
-            ek = self.e[:,:,start:end] if self.e is not None else None
-            usage = self.get_usage()[:,:,start:end]
-
+        end = end or None
+        usage = self.get_usage()
+        k = self.k[:,:,start:end]
+        sk = self.shrinkage[:,:,start:end] if self.shrinkage is not None else None
+        ek = self.selection[:,:,start:end] if self.selection is not None else None
+        usage = usage[:,:,start:end] if usage is not None else None
         return k, sk, ek, usage
 
     def get_v_size(self, ni: int):
-        return self.v[ni].shape[2]
+        return self.values[ni].shape[-1]
 
     def engaged(self):
         return self.k is not None
 
     @property
     def size(self):
-        if self.k is None:
-            return 0
-        else:
-            return self.k.shape[-1]
-
-    @property
-    def num_groups(self):
-        return len(self.v)
+        return self.k.shape[-1] if self.k is not None else 0
 
     @property
     def key(self):
         return self.k
 
-    @property
-    def value(self):
-        return self.v
 
-    @property
-    def shrinkage(self):
-        return self.s
+def maybe_cat(prev, new):
+    return torch.cat([prev, new], -1) if prev is not None else new
 
-    @property
-    def selection(self):
-        return self.e
-
+def splice(x, start, end):
+    if x is None:
+        return None
+    if end == 0:
+        return x[:,:,:start]
+    return torch.cat([x[:,:,:start], x[:,:,end:]], -1)
