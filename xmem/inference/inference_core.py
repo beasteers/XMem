@@ -66,7 +66,7 @@ class InferenceCore:
         image, self.pad = pad_divide_by(image, 16)
         image = image.unsqueeze(0) # add the batch dimension
         if (mask is None or not mask.shape[0]) and not self.memory.work_mem.engaged():
-            return torch.ones((1, *image.shape[1:]))
+            return torch.ones((1, *image.shape[1:])), []
 
         is_mem_frame = (
             (self.curr_ti-self.last_mem_ti >= self.mem_every) or 
@@ -117,7 +117,7 @@ class InferenceCore:
                     pred_mask_no_bg = mask_pred_to_binary(pred_prob_with_bg)[1:]
                     mask, track_ids, unmatched_rows, new_rows = assign_masks(pred_mask_no_bg, mask, pred_prob_no_bg)
                     if len(new_rows):
-                        print("unmatched/new rows", unmatched_rows, new_rows, len(mask))
+                        # print("unmatched/new rows", unmatched_rows, new_rows, len(mask))
                         self.set_all_labels(len(mask))
                     track_ids = [self.all_labels[i] for i in track_ids]
                 elif len(self.all_labels) != len(mask):
@@ -199,7 +199,8 @@ def mask_iou(a, b, eps=1e-7):
 
 
 def assign_masks(binary_masks, new_masks, pred_mask, min_iou=0.4):
-    iou = mask_iou(binary_masks, new_masks).cpu().numpy()
+    iou = mask_iou(binary_masks, new_masks)    
+    iou = iou.cpu().numpy()
     rows, cols = linear_sum_assignment(iou, maximize=True)
     cost = iou[rows, cols]
     rows = rows[cost > min_iou]
