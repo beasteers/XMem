@@ -16,7 +16,7 @@ MODEL_DIR = os.getenv("MODEL_DIR") or os.path.join(ROOT_DIR, 'saves')
 
 def ensure_checkpoint(key='XMem', path=None, file_id=None):
     file_id = file_id or FILE_IDS[key]
-    path = path or os.path.join(MODEL_DIR, '{key}.pth')
+    path = path or os.path.join(MODEL_DIR, f'{key}.pth')
     if not os.path.isfile(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
