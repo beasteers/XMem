@@ -35,8 +35,7 @@ xmem_config = {
 
 @torch.no_grad()
 def main(src, vocab='lvis', detect_every=1, skip_frames=30, fps_down=1, size=480):
-    from detic import Detic
-    from ptgprocess.util import draw_boxes
+    from detic.inference import Detic
 
     # NOTE: xmem rounds image sizes to a factor of 16
     WH = (int(720/480*size)//16*16, int(size)//16*16)
