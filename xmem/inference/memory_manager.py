@@ -146,7 +146,7 @@ class MemoryManager:
         all_readout_mem = torch.cat([
             self._readout(affinity[gi], gv)
             for gi, gv in sorted(all_memory_value.items())
-        ], 0)
+        ], 0) if len(all_memory_value) else torch.zeros((0, self.CV, h, w))
 
         return all_readout_mem.view(all_readout_mem.shape[0], self.CV, h, w)
 
