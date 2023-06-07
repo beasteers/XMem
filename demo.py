@@ -34,12 +34,12 @@ xmem_config = {
 
 
 @torch.no_grad()
-def main(src, vocab='lvis', detect_every=1, skip_frames=0, fps_down=1, size=480):
+def main(src, vocab='lvis', detect_every=1, skip_frames=0, fps_down=1, size=480, dilate_size_threshold=0.01):
     # object detector
     detic_model = Detic(vocab, conf_threshold=0.5, masks=True).to(device)
     print(detic_model.labels)
 
-    # box tracker
+    # box tracker. max_age=None ensures established objects dont get deleted.
     ds_tracker = deep_sort.Tracker(deep_sort.NearestNeighbor('cosine', 0.2), max_age=None)
     # ds_tracker.tracks is a dictionary of object_id -> Track
     # see: https://github.com/VIDA-NYU/deep_sort/blob/master/deep_sort/track.py
@@ -105,7 +105,8 @@ def main(src, vocab='lvis', detect_every=1, skip_frames=0, fps_down=1, size=480)
                 labels = detic_model.labels[cls_ids]
 
                 # increase the size of very small masks to make tracking easier
-                mask = dilate_masks(mask, kernel)
+                if dilate_size_threshold is not None:
+                    mask = dilate_masks(mask, kernel, dilate_size_threshold)
 
                 # update deep sort
                 # matches, unmatched_tracks, unmatched_detections = ds_tracker._match([])
