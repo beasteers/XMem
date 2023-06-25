@@ -11,4 +11,7 @@ DEFAULT_CONFIG = {
     'min_mid_term_frames': 5,
     'max_mid_term_frames': 10,
     'max_long_term_elements': 10000,
+    'dilate_size_threshold': 0,
+    'dilation_kernel_size': 5,
+    'tentative_frames': 3,
 }

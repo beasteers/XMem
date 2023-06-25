@@ -1,19 +1,31 @@
 import cv2
 import numpy as np
 import torch
+
+from xmem.inference.track import Track
 from xmem.inference.memory_manager import MemoryManager
-from xmem.model.network import XMem
+from xmem.model.network import XMem as XMemModel
 from xmem.model.aggregate import aggregate
+from xmem.util.tensor_util import pad_divide_by, unpad
+from .config import DEFAULT_CONFIG
+from ..checkpoint import ensure_checkpoint
 
 from scipy.optimize import linear_sum_assignment
 
-from xmem.util.tensor_util import pad_divide_by, unpad
+device = 'cuda'
 
+class XMem(torch.nn.Module):
+    def __init__(self, config, checkpoint_path=None, map_location=None):
+        super().__init__()
+        self.config = config = {**DEFAULT_CONFIG, **(config or {})}
+        checkpoint_path = checkpoint_path or ensure_checkpoint()
+        self.map_location = map_location
+        self.network = XMemModel(config, checkpoint_path, map_location)
+        self.network.eval()
 
-class InferenceCore:
-    def __init__(self, network:XMem, config):
-        self.config = config
-        self.network = network
+        # box tracks
+        self._tracks = {}
+
         self.mem_every = config['mem_every']
         self.deep_update_every = config['deep_update_every']
         self.enable_long_term = config['enable_long_term']
@@ -21,21 +33,29 @@ class InferenceCore:
         # if deep_update_every < 0, synchronize deep update with memory frame
         self.deep_update_sync = (self.deep_update_every < 0)
 
+        # a kernel to make tiny segmentatation maps a bit bigger (e.g. toothpicks)
+        self.dilate_size_threshold = config.get('dilate_size_threshold')
+        kernel_size = config.get('dilation_kernel_size') or 0
+        self.kernel = np.ones((kernel_size, kernel_size), dtype=np.int32)
+
+        self.tentative_frame_count = config.get('tentative_frames') or 0
+        self.track_max_age = config.get('max_age') or None
+
         self.clear_memory()
-        self.all_labels = []
         self.next_label = 0
 
     def clear_memory(self):
         self.curr_ti = 0
         self.last_mem_ti = 0
+        self.track_ids = []
         if not self.deep_update_sync:
             self.last_deep_update_ti = -self.deep_update_every
         self.memory = MemoryManager(config=self.config)
 
     def delete_object_id(self, object_id):
-        index = self.all_labels.index(object_id)
+        index = self.track_ids.index(object_id)
         self.memory.delete_object_id(object_id, index)
-        del self.all_labels[index]
+        del self.track_ids[index]
 
     def update_config(self, config):
         self.mem_every = config['mem_every']
@@ -46,41 +66,55 @@ class InferenceCore:
         self.deep_update_sync = (self.deep_update_every < 0)
         self.memory.update_config(config)
 
-    def set_all_labels(self, all_labels):
-        if isinstance(all_labels, int):
-            return self.add_labels(all_labels - len(self.all_labels))
-        self.all_labels = all_labels
-        self.next_label = max(max(self.all_labels), self.next_label)
-        print("updated labels", self.all_labels)
+    def _set_track_ids(self, labels):
+        if isinstance(labels, int):
+            labels = labels - len(self.track_ids)
+            if labels < 0: 
+                raise RuntimeError("You cant reduce label count like this.")
+            elif labels == 0:
+                return
+            new = list(range(self.next_label, self.next_label + labels))
+            print('new', new, labels, len(self.track_ids))
+            labels = self.track_ids + new
+        self.track_ids = labels
+        self.next_label = max(max(self.track_ids) + 1, self.next_label)
+        print("updated labels", labels)
 
-    def add_labels(self, n_new):
-        if n_new < 0: raise RuntimeError("not sure how to handle reducing label count.")
-        labels = list(range(self.next_label, self.next_label + n_new))
-        self.all_labels = self.all_labels + labels
-        self.next_label += len(labels)
-        print("added labels", labels)
+    def forward(self, image, mask=None, valid_track_ids=None, no_update=False, binarize_mask=True):
+        # preprocess image
 
-    def step(self, image, mask=None, valid_labels=None, end=False):
         # image: 3*H*W
         # mask: num_objects*H*W or None
-        image, self.pad = pad_divide_by(image, 16)
+        image, pad = pad_divide_by(image, 16)
         image = image.unsqueeze(0) # add the batch dimension
-        if (mask is None or not mask.shape[0]) and not self.memory.work_mem.engaged():
-            return torch.ones((1, *image.shape[1:])), []
 
+        # exit early, there is nothing to track
+        if (mask is None or not mask.shape[0]) and not self.memory.work_mem.engaged():
+            input_track_ids = None if mask is None else np.array([])
+            return torch.ones((0 if binarize_mask else 1, *image.shape[-2:])), np.array([]), input_track_ids
+
+        # should we update memory?
         is_mem_frame = (
             (self.curr_ti-self.last_mem_ti >= self.mem_every) or 
             (mask is not None)
-        ) and (not end)
+        ) and (not no_update)
+
+        # do we need to compute segmentation masks?
         need_segment = (self.curr_ti > 0) and (
-            (valid_labels is None) or 
-            (len(self.all_labels) != len(valid_labels))
+            (valid_track_ids is None) or 
+            (len(self.track_ids) != len(valid_track_ids))
         )
+
+        # should we do a deep memory update?
         is_deep_update = (
             (self.deep_update_sync and is_mem_frame) or  # synchronized
             (not self.deep_update_sync and self.curr_ti-self.last_deep_update_ti >= self.deep_update_every) # no-sync
-        ) and (not end)
-        is_normal_update = (not self.deep_update_sync or not is_deep_update) and (not end)
+        ) and (not no_update)
+
+        # is this a normal memory update?
+        is_normal_update = (not self.deep_update_sync or not is_deep_update) and (not no_update)
+
+        # encode image
 
         key, shrinkage, selection, f16, f8, f4 = self.network.encode_key(
             image, 
@@ -91,7 +125,8 @@ class InferenceCore:
         # f4:  torch.Size([1, 256,  H/4,  W/4])
         multi_scale_features = (f16, f8, f4)
 
-        # segment the current frame is needed
+        # predict segmentation mask for current timestamp
+
         pred_prob_no_bg = pred_prob_with_bg = None
         if need_segment:
             # shape [1, ?]
@@ -109,23 +144,33 @@ class InferenceCore:
             if is_normal_update:
                 self.memory.set_hidden(hidden)
 
-        # associate masks with tracks using IoU
-        track_ids = valid_labels
-        if valid_labels is None:
-            if mask is not None:
-                if pred_prob_no_bg is not None:
+        # handle external segmentation mask
+
+        input_track_ids = valid_track_ids
+        if mask is not None:
+
+            # match object detections with minimum IoU
+
+            # increase the size of very small masks to make tracking easier
+            if self.dilate_size_threshold:
+                mask = dilate_masks(mask, self.kernel, self.dilate_size_threshold)
+
+            if valid_track_ids is None:
+                if pred_prob_no_bg is None:
+                    assert self.curr_ti == 0
+                    self._set_track_ids(len(mask))
+                    input_track_ids = self.track_ids
+                else:
                     pred_mask_no_bg = mask_pred_to_binary(pred_prob_with_bg)[1:]
-                    mask, track_ids, unmatched_rows, new_rows = assign_masks(pred_mask_no_bg, mask, pred_prob_no_bg)
+                    mask, input_track_ids, unmatched_rows, new_rows = assign_masks(
+                        pred_mask_no_bg, mask, pred_prob_no_bg)
                     if len(new_rows):
                         # print("unmatched/new rows", unmatched_rows, new_rows, len(mask))
-                        self.set_all_labels(len(mask))
-                    track_ids = [self.all_labels[i] for i in track_ids]
-                elif len(self.all_labels) != len(mask):
-                    self.set_all_labels(len(mask))
-                    track_ids = self.all_labels
+                        self._set_track_ids(len(mask))
+                    input_track_ids = [self.track_ids[i] for i in input_track_ids]
 
-        # use the input mask if any
-        if mask is not None:
+            # convert input mask
+
             mask, _ = pad_divide_by(mask, 16)
 
             if pred_prob_no_bg is not None:
@@ -133,20 +178,22 @@ class InferenceCore:
                 pred_prob_no_bg[:, (mask.sum(0) > 0.5)] = 0
                 # shift by 1 because mask/pred_prob_no_bg do not contain background
                 mask = mask.type_as(pred_prob_no_bg)
-                if valid_labels is not None:
-                    shift_by_one_non_labels = [i for i in range(pred_prob_no_bg.shape[0]) if (i+1) not in valid_labels]
+                if valid_track_ids is not None:
+                    shift_by_one_non_labels = [
+                        i for i in range(pred_prob_no_bg.shape[0]) 
+                        if (i+1) not in valid_track_ids
+                    ]
                     # non-labelled objects are copied from the predicted mask
                     mask[shift_by_one_non_labels] = pred_prob_no_bg[shift_by_one_non_labels]
 
             # add background back in and convert using softmax
             pred_prob_with_bg = aggregate(mask, dim=0)
-            # for i, m in enumerate(mask_pred_to_binary(pred_prob_with_bg)):
-            #     cv2.imwrite(f'seg2{i}.jpg', m.cpu().int().numpy()*255)
 
             # also create new hidden states
-            self.memory.create_hidden_state(len(self.all_labels), key)
+            self.memory.create_hidden_state(len(self.track_ids), key)
 
-        # save as memory if needed
+        # save to memory
+
         if is_mem_frame:
             # hidden: torch.Size([1, 3, 64, 2, 2])
             # image segmentation to memory value
@@ -156,7 +203,7 @@ class InferenceCore:
                 is_deep_update=is_deep_update)
             # save value in memory
             self.memory.add_memory(
-                key, shrinkage, value, self.all_labels, 
+                key, shrinkage, value, self.track_ids, 
                 selection=selection if self.enable_long_term else None)
             self.last_mem_ti = self.curr_ti
 
@@ -164,9 +211,42 @@ class InferenceCore:
                 self.memory.set_hidden(hidden)
                 self.last_deep_update_ti = self.curr_ti
 
+        # get outputs
+        pred_mask = unpad(pred_prob_with_bg, pad)
+        track_ids = np.asarray(self.track_ids)
+        input_track_ids = np.asarray(input_track_ids) if input_track_ids is not None else None
+
+        # handle track deletions
+        if input_track_ids is not None:
+            _, deleted = Track.update_tracks(
+                self._tracks, input_track_ids, self.curr_ti,
+                n_init=self.tentative_frame_count,
+                max_age=self.track_max_age)
+            deleted and print('deleted', deleted)
+            keep = np.array([True]+[i not in deleted for i in track_ids])
+            pred_mask = pred_mask[keep]
+            track_ids = track_ids[keep[1:]]
+            for i in deleted:
+                self.delete_object_id(i)
+
+        # convert probabilities to binary masks using argmax
+        if binarize_mask:
+            # covert to binary mask
+            if pred_mask.ndim == 4:
+                pred_mask = pred_mask[0]
+            pred_mask_int = torch.argmax(pred_mask, dim=0) - 1
+            pred_ids = torch.unique(pred_mask_int)
+            pred_ids = pred_ids[pred_ids >= 0]
+            pred_mask = pred_ids[:, None, None] == pred_mask_int[None]
+
+            # what should the output format be?
+            pred_ids = pred_ids.cpu().numpy()
+            track_ids = track_ids[pred_ids]
+
         self.curr_ti += 1
         # pred_prob_with_bg: [1 + num_objects, H, W]
-        return unpad(pred_prob_with_bg, self.pad), track_ids
+        # pred_mask: [num_objects, H, W] if binarize_mask else [1 + num_objects, H, W]
+        return pred_mask, track_ids, input_track_ids
 
 
 
@@ -178,23 +258,9 @@ def mask_pred_to_binary(x):
     return y
 
 def mask_iou(a, b, eps=1e-7):
-    # print(a.shape, a.dtype, b.shape, b.dtype)
-    # for i in range(a.shape[0]):
-    #     cv2.imwrite(f'a{i}.jpg', a[i].cpu().numpy()*255)
-    # for i in range(b.shape[0]):
-    #     cv2.imwrite(f'b{i}.jpg', b[i].cpu().numpy()*255)
-    # a, b: [num_objects, H, W]
     a, b = a[:, None], b[None]
     overlap = (a * b) > 0
     union = (a + b) > 0
-    # print(a.min(), b.min(), a.float().mean(), b.float().mean())
-    # print(union.min(), union.max())
-
-    # for i in range(overlap.shape[0]):
-    #     for j in range(overlap.shape[1]):
-    #         cv2.imwrite(f'overlap{i}{j}.jpg', overlap[i, j].cpu().numpy()*255)
-    #         cv2.imwrite(f'union{i}{j}.jpg', union[i, j].cpu().numpy()*255)
-    # input()
     return 1. * overlap.sum((2, 3)) / (union.sum((2, 3)) + eps)
 
 
@@ -208,16 +274,10 @@ def assign_masks(binary_masks, new_masks, pred_mask, min_iou=0.4):
     # cost = cost[cost > min_iou]
     # existing tracks without a matching detection
     unmatched_rows = sorted(set(range(len(binary_masks))) - set(rows))
+    # deleted_rows = set(deletions) & unmatched_rows
+    # unmatched_rows = sorted(unmatched_rows - deleted_rows)
     # new detections without a matching track
     unmatched_cols = sorted(set(range(len(new_masks))) - set(cols))
-    # for r, c in zip(rows, cols):
-    #     cv2.imwrite(f'ims/match-{r}{c}.jpg', np.concatenate([
-    #         binary_masks[r].cpu().numpy()*255, 
-    #         pred_mask[r].cpu().numpy()*255, 
-    #         new_masks[c].cpu().numpy()*255
-    #     ], 1))
-    # # input()
-    # print("unmatched cols", unmatched_cols)
 
     # create a mask combining everything
     new_rows = torch.arange(len(unmatched_cols)) + len(binary_masks)
@@ -231,8 +291,31 @@ def assign_masks(binary_masks, new_masks, pred_mask, min_iou=0.4):
     if len(new_rows):
         full_masks[new_rows] = new_masks[unmatched_cols]
 
-    object_ids = [
+    # this is the track_ids corresponding to the input masks
+    input_track_ids = [
         r for c, r in sorted(zip(
             (*cols, *unmatched_cols), 
             (*rows, *new_rows.tolist())))]
-    return full_masks, object_ids, unmatched_rows, new_rows
+    return full_masks, input_track_ids, unmatched_rows, new_rows
+
+
+def dilate_masks(mask, kernel, rel_area=0.01):
+    # dilate masks whose overall area is below a certain value
+    # this makes it easier for xmem to track those objects
+    for i, size in enumerate(mask.sum((1, 2))):
+        if size < rel_area * mask.shape[1] * mask.shape[2]:
+            # print("dilating", labels[i], mask[i].shape)
+            mask[i] = torch.as_tensor(
+                cv2.dilate(mask[i].cpu().float().numpy(), kernel, iterations=1), 
+                device=mask.device)
+    return mask
+
+def binarize_mask(prediction):
+    # covert to binary mask
+    if prediction.ndim == 4:
+        prediction = prediction[0]
+    pred_mask_int = torch.argmax(prediction, dim=0) - 1
+    pred_ids = torch.unique(pred_mask_int)
+    pred_ids = pred_ids[pred_ids >= 0]
+    pred_mask = pred_ids[:, None, None] == pred_mask_int[None]
+    return pred_mask
