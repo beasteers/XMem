@@ -143,10 +143,14 @@ class MemoryManager:
                 })
 
         # Shared affinity within each group
-        all_readout_mem = torch.cat([
-            self._readout(affinity[gi], gv)
-            for gi, gv in sorted(all_memory_value.items())
-        ], 0) if len(all_memory_value) else torch.zeros((0, self.CV, h, w))
+        all_readout_mem = (
+            torch.cat([
+                self._readout(affinity[gi], gv)
+                for gi, gv in sorted(all_memory_value.items())
+            ], 0) 
+            if len(all_memory_value) else 
+            torch.zeros(0, self.CV, h, w, device=query_key.device)
+        )
 
         return all_readout_mem.view(all_readout_mem.shape[0], self.CV, h, w)
 
@@ -263,7 +267,7 @@ class MemoryManager:
         similarity = get_similarity(candidate_key, candidate_shrinkage, prototype_key, prototype_selection)
 
         prototype_value = {}
-        prototype_shrinkage = torch.zeros(1, 1, prototype_key.shape[-1], device=prototype_indices.get_device())
+        prototype_shrinkage = torch.zeros(1, 1, prototype_key.shape[-1], device=prototype_indices.device)
         prototype_shrinkage_count = torch.zeros_like(prototype_shrinkage) + 1e-7
         for gi, gv in candidate_value.items():
             # Prototypes are invalid for out-of-bound groups
