@@ -20,7 +20,7 @@ def draw_boxes(im, boxes, labels=None, color=(0,255,0), size=1, text_color=(0, 0
     color = color[None] if color.ndim == 1 else color
     labels = itertools.chain([] if labels is None else labels, itertools.cycle(['']))
     for xy, c in zip(boxes, itertools.cycle(color)):
-        im = cv2.rectangle(im, xy[:2], xy[2:4], tuple(c.tolist()), 2)
+        im = cv2.rectangle(im, xy[:2], xy[2:4], color=tuple(c.tolist()), thickness=1)
     
     for xy, label, c in zip(boxes, labels, itertools.cycle(color)):
         if label:
