@@ -69,6 +69,11 @@ class KeyValueMemoryStore:
             if self.count_usage:
                 del self.use_counts[i]
                 del self.life_counts[i]
+            # # TODO: prune keys
+            n = max((x.shape[-1] for x in self.values.values()), default=0)
+            self.k = self.k[:, :, -n:] if n and self.k is not None else None
+            self.shrinkage = self.shrinkage[:, :, -n:] if n and self.shrinkage is not None else None
+            self.selection = self.selection[:, :, -n:] if n and self.selection is not None else None
 
     def update_usage(self, usages):
         # increase all life count by 1
@@ -148,7 +153,8 @@ class KeyValueMemoryStore:
         return self.values[ni].shape[-1]
 
     def engaged(self):
-        return self.k is not None
+        # return self.k is not None
+        return bool(self.values)
 
     @property
     def size(self):

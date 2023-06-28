@@ -128,6 +128,8 @@ def get_video_info(src, size, fps_down=1, nrows=1, ncols=1):
     # possibly reduce the video frame rate
     video_info.og_fps = video_info.fps
     video_info.fps /= fps_down or 1
+
+    print(f"Input Video {src}\nsize: {WH}  fps: {video_info.fps}")
     return video_info, WH
 
 

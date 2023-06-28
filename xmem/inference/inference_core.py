@@ -89,7 +89,8 @@ class XMem(torch.nn.Module):
         image = image.unsqueeze(0) # add the batch dimension
 
         # exit early, there is nothing to track
-        if (mask is None or not mask.shape[0]) and not self.memory.work_mem.engaged():
+        engaged = self.memory.work_mem.engaged()
+        if (mask is None or not mask.shape[0]) and not engaged:
             input_track_ids = None if mask is None else np.array([])
             return torch.ones((0 if binarize_mask else 1, *image.shape[-2:])), np.array([]), input_track_ids
 
@@ -100,9 +101,9 @@ class XMem(torch.nn.Module):
         ) and (not no_update)
 
         # do we need to compute segmentation masks?
-        need_segment = (self.curr_ti > 0) and (
-            (valid_track_ids is None) or 
-            (len(self.track_ids) != len(valid_track_ids))
+        need_segment = engaged and (
+            valid_track_ids is None or 
+            len(self.track_ids) != len(valid_track_ids)
         )
 
         # should we do a deep memory update?
@@ -157,7 +158,7 @@ class XMem(torch.nn.Module):
 
             if valid_track_ids is None:
                 if pred_prob_no_bg is None:
-                    assert self.curr_ti == 0
+                    assert not engaged
                     self._set_track_ids(len(mask))
                     input_track_ids = self.track_ids
                 else:
