@@ -15,7 +15,7 @@ from scipy.optimize import linear_sum_assignment
 device = 'cuda'
 
 class XMem(torch.nn.Module):
-    def __init__(self, config, checkpoint_path=None, map_location=None):
+    def __init__(self, config, checkpoint_path=None, map_location=None, Track=Track):
         super().__init__()
         self.config = config = {**DEFAULT_CONFIG, **(config or {})}
         checkpoint_path = checkpoint_path or ensure_checkpoint()
@@ -24,7 +24,8 @@ class XMem(torch.nn.Module):
         self.network.eval()
 
         # box tracks
-        self._tracks = {}
+        self.Track = Track
+        self.tracks = {}
 
         self.mem_every = config['mem_every']
         self.deep_update_every = config['deep_update_every']
@@ -48,6 +49,7 @@ class XMem(torch.nn.Module):
         self.curr_ti = 0
         self.last_mem_ti = 0
         self.track_ids = []
+        self.tracks.clear()
         if not self.deep_update_sync:
             self.last_deep_update_ti = -self.deep_update_every
         self.memory = MemoryManager(config=self.config)
@@ -92,7 +94,10 @@ class XMem(torch.nn.Module):
         engaged = self.memory.work_mem.engaged()
         if (mask is None or not mask.shape[0]) and not engaged:
             input_track_ids = None if mask is None else np.array([])
-            return torch.ones((0 if binarize_mask else 1, *image.shape[-2:])), np.array([]), input_track_ids
+            return (
+                torch.ones((0 if binarize_mask else 1, *image.shape[-2:]), device=image.device), 
+                np.array([]), 
+                input_track_ids)
 
         # should we update memory?
         is_mem_frame = (
@@ -219,8 +224,8 @@ class XMem(torch.nn.Module):
 
         # handle track deletions
         if input_track_ids is not None:
-            _, deleted = Track.update_tracks(
-                self._tracks, input_track_ids, self.curr_ti,
+            _, deleted = self.Track.update_tracks(
+                self.tracks, input_track_ids, self.curr_ti,
                 n_init=self.tentative_frame_count,
                 max_age=self.track_max_age)
             deleted and print('deleted', deleted)
@@ -250,6 +255,23 @@ class XMem(torch.nn.Module):
         return pred_mask, track_ids, input_track_ids
 
 
+    def match_iou(self, xmem_mask, other_mask, min_iou=0.4):
+        track_ids, other_ids = self.iou_assignment(xmem_mask, other_mask, min_iou)
+        track_ids = np.array(self.track_ids, dtype=int)[track_ids]
+        return track_ids, other_ids
+    
+    @staticmethod
+    def iou_assignment(first_mask, other_mask, min_iou=0.4):
+        iou = mask_iou(first_mask, other_mask)
+        iou = iou.cpu().numpy() if isinstance(iou, torch.Tensor) else iou
+        track_ids, other_ids = linear_sum_assignment(iou, maximize=True)
+        if min_iou:
+            cost = iou[track_ids, other_ids]
+            track_ids = track_ids[cost > min_iou]
+            other_ids = other_ids[cost > min_iou]
+        return track_ids, other_ids
+
+
 
 def mask_pred_to_binary(x):
     idxs = torch.argmax(x, dim=0)
@@ -265,7 +287,7 @@ def mask_iou(a, b, eps=1e-7):
     return 1. * overlap.sum((2, 3)) / (union.sum((2, 3)) + eps)
 
 
-def assign_masks(binary_masks, new_masks, pred_mask, min_iou=0.4):
+def assign_masks(binary_masks, new_masks, pred_mask=None, min_iou=0.4):
     iou = mask_iou(binary_masks, new_masks)    
     iou = iou.cpu().numpy()
     rows, cols = linear_sum_assignment(iou, maximize=True)
@@ -275,20 +297,25 @@ def assign_masks(binary_masks, new_masks, pred_mask, min_iou=0.4):
     # cost = cost[cost > min_iou]
     # existing tracks without a matching detection
     unmatched_rows = sorted(set(range(len(binary_masks))) - set(rows))
-    # deleted_rows = set(deletions) & unmatched_rows
-    # unmatched_rows = sorted(unmatched_rows - deleted_rows)
     # new detections without a matching track
     unmatched_cols = sorted(set(range(len(new_masks))) - set(cols))
-
-    # create a mask combining everything
+    # create indices for new tracks
     new_rows = torch.arange(len(unmatched_cols)) + len(binary_masks)
+
+    # merge masks - create blank array with the right size
     n = len(binary_masks) + len(new_rows)
     full_masks = torch.zeros((n, *binary_masks.shape[1:]), device=binary_masks.get_device())
     new_masks = new_masks.float()
+
+    # first add matches
     if len(rows):
         full_masks[rows] = new_masks[cols]
+    # then for tracks that weren't matched, insert the xmem predictions
     if len(unmatched_rows):
+        if pred_mask is None:
+            pred_mask = binary_masks
         full_masks[unmatched_rows] = pred_mask[unmatched_rows]
+    # for new detections without a track, insert with new track IDs
     if len(new_rows):
         full_masks[new_rows] = new_masks[unmatched_cols]
 
@@ -297,6 +324,7 @@ def assign_masks(binary_masks, new_masks, pred_mask, min_iou=0.4):
         r for c, r in sorted(zip(
             (*cols, *unmatched_cols), 
             (*rows, *new_rows.tolist())))]
+
     return full_masks, input_track_ids, unmatched_rows, new_rows
 
 

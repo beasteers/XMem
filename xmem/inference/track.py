@@ -31,15 +31,15 @@ class Track:
         self.steps_since_update = 0
         self.hits = 1
 
-    @staticmethod
-    def update_tracks(tracks, track_ids, curr_time, **kw):
+    @classmethod
+    def update_tracks(cls, tracks, track_ids, curr_time, **kw):
         new = [t for t in track_ids if t not in tracks]
         # update track counters
         for track in tracks.values():
             track.step(curr_time)
         for ti in track_ids:
             if ti not in tracks:
-                tracks[ti] = Track(ti, curr_time, **kw)
+                tracks[ti] = cls(ti, curr_time, **kw)
             tracks[ti].mark_hit()
         for t in tracks.values():
             t.check_missed()

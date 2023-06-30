@@ -255,7 +255,7 @@ class MemoryManager:
         N = candidate_key.shape[-1]
 
         # find the indices with max usage
-        _, max_usage_indices = torch.topk(usage, k=min(self.num_prototypes, usage.shape[-1]), dim=-1, sorted=True)
+        _, max_usage_indices = torch.topk(usage, k=self.num_prototypes, dim=-1, sorted=True)
         prototype_indices = max_usage_indices.flatten()
 
         prototype_key = candidate_key[:, :, prototype_indices]
@@ -271,7 +271,7 @@ class MemoryManager:
         prototype_shrinkage_count = torch.zeros_like(prototype_shrinkage) + 1e-7
         for gi, gv in candidate_value.items():
             # Prototypes are invalid for out-of-bound groups
-            valid = prototype_indices >= (N-candidate_value[gi].shape[2]) 
+            valid = prototype_indices >= (N-gv.shape[2]) 
             if not valid.any():
                 continue
 

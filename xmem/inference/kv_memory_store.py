@@ -38,8 +38,8 @@ class KeyValueMemoryStore:
         return f'Memory(key: {nk}, {len(self.values)} values)'
 
     def add(self, key, value, shrinkage, selection, objects: List[int]):
-        # key: [1, C, N]
-        # value: [num_objects, C, N]
+        # key: [1, Ck, N]
+        # value: [num_objects, Cv, N]
         # shrinkage: [?, ?, N]
         # selection: [?, ?, N]
         # new_count: [1, 1, N]
@@ -59,9 +59,10 @@ class KeyValueMemoryStore:
         for gi in set(self.values) | set(value):
             gv = value[gi]
             self.values[gi] = maybe_cat(self.values.get(gi), gv)
+            # assert key.shape[-1] == gv.shape[-1], f'key({key.shape[-1]}) != value({gv.shape[-1]})'
             if self.count_usage:
-                self.use_counts[gi] = maybe_cat(self.use_counts.get(gi), new_count)
-                self.life_counts[gi] = maybe_cat(self.life_counts.get(gi), new_life)
+                self.use_counts[gi] = maybe_cat(self.use_counts.get(gi), new_count[:,:,-gv.shape[-1]:])
+                self.life_counts[gi] = maybe_cat(self.life_counts.get(gi), new_life[:,:,-gv.shape[-1]:])
 
     def delete(self, i):
         if i in self.values:
@@ -119,6 +120,8 @@ class KeyValueMemoryStore:
             if self.count_usage:
                 self.use_counts[gi] = splice(self.use_counts[gi], start, end)
                 self.life_counts[gi] = splice(self.life_counts[gi], start, end)
+                # assert self.values[gi].shape[-1] == self.use_counts[gi].shape[-1], f'{self.values[gi].shape[-1]} != {self.use_counts[gi].shape[-1]}'
+                # assert self.values[gi].shape[-1] == self.life_counts[gi].shape[-1], f'{self.values[gi].shape[-1]} != {self.life_counts[gi].shape[-1]}'
 
     def remove_obsolete_features(self, max_size: int):
         # get topk usage
@@ -127,12 +130,14 @@ class KeyValueMemoryStore:
         survived = (usage > values[-1])
 
         # filter all using topk usage
+        # print('k', self.k.shape)
         self.k = self.k[:, :, survived]
         self.shrinkage = self.shrinkage[:, :, survived] if self.shrinkage is not None else None
         # Long-term memory does not store ek so this should not be needed
         self.selection = self.selection[:, :, survived] if self.selection is not None else None
 
         for gi in self.values:
+            # print('v', self.values[gi].shape, self.use_counts[gi].shape, self.life_counts[gi].shape)
             s = survived[-self.values[gi].shape[-1]:]
             self.values[gi] = self.values[gi][:, :, s]
             if self.count_usage:
@@ -171,6 +176,8 @@ def maybe_cat(prev, new):
 def splice(x, start, end):
     if x is None:
         return None
+    if start == 0:
+        return x[:,:,end:]
     if end == 0:
         return x[:,:,:start]
     return torch.cat([x[:,:,:start], x[:,:,end:]], -1)
