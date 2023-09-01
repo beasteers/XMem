@@ -79,7 +79,7 @@ class Track:
         if self.state == TrackState.Tentative and self.steps_since_update > 1:
             return 1 - self.steps_since_update # self.steps_since_update > 1
         elif self._max_age:
-            return self._max_age - (self.last_predict_time - self.last_seen)
+            return self._max_age - self.steps_since_update
         return 1000
 
     def check_missed(self):
