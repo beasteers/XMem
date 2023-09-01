@@ -23,7 +23,7 @@ class Track:
         self._max_age = max_age
 
         # initial state
-        self.state = TrackState.Tentative
+        self.state = TrackState.Tentative if n_init > 0 else TrackState.Confirmed
         self.track_id = track_id
         # initial time
         self.first_seen = self.last_seen = t_obs
@@ -37,10 +37,12 @@ class Track:
         # update track counters
         for track in tracks.values():
             track.step(curr_time)
+        # create new tracks
         for ti in track_ids:
             if ti not in tracks:
                 tracks[ti] = cls(ti, curr_time, **kw)
             tracks[ti].mark_hit()
+        # check for missed tracks
         for t in tracks.values():
             t.check_missed()
 
@@ -76,8 +78,8 @@ class Track:
     def leiway(self):
         if self.state == TrackState.Tentative and self.steps_since_update > 1:
             return 1 - self.steps_since_update # self.steps_since_update > 1
-        elif self._max_age and self.steps_since_update > self._max_age:
-            return self._max_age - self.steps_since_update
+        elif self._max_age:
+            return self._max_age - (self.last_predict_time - self.last_seen)
         return 1000
 
     def check_missed(self):

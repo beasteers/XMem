@@ -1,263 +1,322 @@
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
+import logging
 
 from xmem.inference.track import Track
 from xmem.inference.memory_manager import MemoryManager
 from xmem.model.network import XMem as XMemModel
 from xmem.model.aggregate import aggregate
 from xmem.util.tensor_util import pad_divide_by, unpad
-from .config import DEFAULT_CONFIG
+from .config import get_config
 from ..checkpoint import ensure_checkpoint
+from torchvision.ops import masks_to_boxes
 
 from scipy.optimize import linear_sum_assignment
+
+from IPython import embed
+
+
+log = logging.getLogger('XMem')
 
 device = 'cuda'
 
 class XMem(torch.nn.Module):
-    def __init__(self, config, checkpoint_path=None, map_location=None, Track=Track):
+    next_label = 0
+    def __init__(self, config, checkpoint_path=None, map_location=None, model=None, Track=Track):
         super().__init__()
-        self.config = config = {**DEFAULT_CONFIG, **(config or {})}
-        checkpoint_path = checkpoint_path or ensure_checkpoint()
-        self.map_location = map_location
-        self.network = XMemModel(config, checkpoint_path, map_location)
-        self.network.eval()
+        config = get_config(config)
+        if model is None:
+            checkpoint_path = checkpoint_path or ensure_checkpoint()
+            model = XMemModel(config, checkpoint_path, map_location)
+            model.eval()
+
+        self.model = model
+        self.config = config
 
         # box tracks
         self.Track = Track
-        self.tracks = {}
 
-        self.mem_every = config['mem_every']
-        self.deep_update_every = config['deep_update_every']
-        self.enable_long_term = config['enable_long_term']
-
-        # if deep_update_every < 0, synchronize deep update with memory frame
-        self.deep_update_sync = (self.deep_update_every < 0)
-
-        # a kernel to make tiny segmentatation maps a bit bigger (e.g. toothpicks)
-        self.dilate_size_threshold = config.get('dilate_size_threshold')
-        kernel_size = config.get('dilation_kernel_size') or 0
-        self.kernel = np.ones((kernel_size, kernel_size), dtype=np.int32)
-
-        self.tentative_frame_count = config.get('tentative_frames') or 0
-        self.track_max_age = config.get('max_age') or None
-
+        self._set_config(config)
         self.clear_memory()
-        self.next_label = 0
 
-    def clear_memory(self):
-        self.curr_ti = 0
-        self.last_mem_ti = 0
-        self.track_ids = []
-        self.tracks.clear()
-        if not self.deep_update_sync:
-            self.last_deep_update_ti = -self.deep_update_every
-        self.memory = MemoryManager(config=self.config)
-
-    def delete_object_id(self, object_id):
-        index = self.track_ids.index(object_id)
-        self.memory.delete_object_id(object_id, index)
-        del self.track_ids[index]
+    def clear_memory(self, reset_index=False):
+        # memory
+        self.curr_it = 0
+        self.last_mem_it = 0
+        if not self._deep_update_sync:
+            self.last_deep_update_it = -self._deep_update_every
+        
+        track_offset = 0
+        if not reset_index and hasattr(self, 'memory'):
+            track_offset = self.memory.track_offset
+        self.memory = MemoryManager(config=self.config, Track=self.Track, track_offset=track_offset)
 
     def update_config(self, config):
-        self.mem_every = config['mem_every']
-        self.deep_update_every = config['deep_update_every']
-        self.enable_long_term = config['enable_long_term']
-
-        # if deep_update_every < 0, synchronize deep update with memory frame
-        self.deep_update_sync = (self.deep_update_every < 0)
+        self._set_config(config)
         self.memory.update_config(config)
 
-    def _set_track_ids(self, labels):
-        if isinstance(labels, int):
-            labels = labels - len(self.track_ids)
-            if labels < 0: 
-                raise RuntimeError("You cant reduce label count like this.")
-            elif labels == 0:
-                return
-            new = list(range(self.next_label, self.next_label + labels))
-            print('new', new, labels, len(self.track_ids))
-            labels = self.track_ids + new
-        self.track_ids = labels
-        self.next_label = max(max(self.track_ids) + 1, self.next_label)
-        print("updated labels", labels)
+    def delete_object_id(self, object_id):
+        self.memory.delete_object_id(object_id)
 
-    def forward(self, image, mask=None, valid_track_ids=None, no_update=False, binarize_mask=True):
-        # preprocess image
+    def _set_config(self, config):
+        # memory
+        self._mem_every = config['mem_every']
+        self._deep_update_every = config['deep_update_every']
+        self._enable_long_term = config['enable_long_term']
+        self._deep_update_sync = (self._deep_update_every < 0)  # synchronize deep update with memory frame
 
-        # image: 3*H*W
-        # mask: num_objects*H*W or None
-        image, pad = pad_divide_by(image, 16)
+        # a kernel to make tiny segmentatation maps a bit bigger (e.g. toothpicks)
+        self._dilate_size_threshold = config.get('dilate_size_threshold')
+        kernel_size = config.get('dilation_kernel_size') or 0
+        self._dilation_kernel = np.ones((kernel_size, kernel_size), dtype=np.int32)
+
+    def forward(self, image, mask=None, valid_track_ids=None, no_update=False, binarize_mask=True, only_confirmed=False, only_visible=True):
+        
+        # ----------------------------- preprocess image ----------------------------- #
+
+        # image: [3, H, W]
+        # mask: [num_objects, H, W] or None
+        image, pad = pad_divide_by(image, 16)  # image should be divisible by 16
         image = image.unsqueeze(0) # add the batch dimension
 
-        # exit early, there is nothing to track
+        # --------------------------- check empty tracker: --------------------------- #
+
+        # exit early if there is nothing to track
         engaged = self.memory.work_mem.engaged()
-        if (mask is None or not mask.shape[0]) and not engaged:
+        if not engaged and (mask is None or not mask.shape[0]):
             input_track_ids = None if mask is None else np.array([])
             return (
                 torch.ones((0 if binarize_mask else 1, *image.shape[-2:]), device=image.device), 
                 np.array([]), 
                 input_track_ids)
 
+        # ------------------------- check memory conditions: ------------------------- #
+
         # should we update memory?
-        is_mem_frame = (
-            (self.curr_ti-self.last_mem_ti >= self.mem_every) or 
+        is_mem_frame = not no_update and (
+            # update every N steps
+            (self.curr_it - self.last_mem_it >= self._mem_every) or 
+            # or when provided with new masks
             (mask is not None)
-        ) and (not no_update)
+        )
 
         # do we need to compute segmentation masks?
         need_segment = engaged and (
+            # if the user doesn't provide assigned masks
             valid_track_ids is None or 
-            len(self.track_ids) != len(valid_track_ids)
+            # or not for for every track
+            len(self.memory.track_ids) != len(valid_track_ids)
         )
 
         # should we do a deep memory update?
-        is_deep_update = (
-            (self.deep_update_sync and is_mem_frame) or  # synchronized
-            (not self.deep_update_sync and self.curr_ti-self.last_deep_update_ti >= self.deep_update_every) # no-sync
-        ) and (not no_update)
+        is_deep_update = not no_update and (
+            # do a deep update on memory update (if synced)
+            is_mem_frame
+            if self._deep_update_sync else 
+            self.curr_it - self.last_deep_update_it >= self._deep_update_every
+            # do a deep update every N steps (if synced)
+        )
 
-        # is this a normal memory update?
-        is_normal_update = (not self.deep_update_sync or not is_deep_update) and (not no_update)
+        # ------------------------ encode, segment, and match: ----------------------- #
 
         # encode image
+        key, shrinkage, selection, multi_scale_features = self._encode_image(
+            image, need_segment, is_mem_frame
+        )
 
-        key, shrinkage, selection, f16, f8, f4 = self.network.encode_key(
+        # predict, segment image
+        pred_prob_no_bg = pred_prob_with_bg = None
+        if need_segment:
+            # predict segmentation mask for current timestamp
+            pred_prob_with_bg, pred_prob_no_bg = self._segment(
+                key, selection, multi_scale_features, 
+                is_normal_update=is_mem_frame and not is_deep_update
+            )
+
+        # handle external segmentation mask
+        input_track_ids = valid_track_ids
+        if mask is not None:
+            mask = F.pad(mask, pad)
+
+            # match object detections with minimum IoU
+            mask, input_track_ids = self._match_detection_masks(
+                mask, pred_prob_no_bg, pred_prob_with_bg, valid_track_ids, key
+            )
+            mask, pred_prob_no_bg, pred_prob_with_bg = self._valid_mask_predictions(
+                mask, pred_prob_no_bg, pred_prob_with_bg, valid_track_ids
+            )
+
+        # ------------------------ update memory and outputs: ------------------------ #
+
+        # prepare outputs
+        pred_mask = unpad(pred_prob_with_bg, pad)  # reverse padding
+        track_ids = np.asarray(self.memory.track_ids)
+        input_track_ids = np.asarray(input_track_ids) if input_track_ids is not None else None
+
+        # save to memory
+        if is_mem_frame:
+            self._update_memory(
+                image, key, shrinkage, selection, multi_scale_features, 
+                pred_prob_with_bg, is_deep_update)
+
+        # handle track additions and deletions
+        if input_track_ids is not None:
+            pred_mask, track_ids = self._update_tracks(pred_mask, track_ids, input_track_ids)
+
+        # convert probabilities to binary masks using argmax
+        if binarize_mask:
+            pred_mask, track_ids = self._binarize_mask(pred_mask, track_ids)
+
+        # only return tracks that have been confirmed by multiple detections
+        if only_confirmed:
+            confirmed = np.array([self.memory.tracks[t].is_confirmed() for t in track_ids], dtype=bool)
+            pred_mask = pred_mask[confirmed]
+            track_ids = track_ids[confirmed]
+
+        # filter out segmentation masks where the entire mask is zeros
+        if only_visible:
+            visible_tracks = pred_mask.any(1).any(1).cpu().numpy()
+            pred_mask = pred_mask[visible_tracks]
+            track_ids = track_ids[visible_tracks]
+
+        self.curr_it += 1
+        # pred_prob_with_bg: [1 + num_objects, H, W]
+        # pred_mask: [num_objects, H, W] if binarize_mask else [1 + num_objects, H, W]
+        return pred_mask, track_ids, input_track_ids
+    
+
+
+
+    # ----------------------------- algorithm steps: ----------------------------- #
+
+
+    def _encode_image(self, image, need_segment, is_mem_frame):
+        '''Encode image features'''
+        key, shrinkage, selection, f16, f8, f4 = self.model.encode_key(
             image, 
-            need_ek=(self.enable_long_term or need_segment), 
+            need_ek=(self._enable_long_term or need_segment), 
             need_sk=is_mem_frame)
         # f16: torch.Size([1, 1024, H/16, W/16])
         # f8:  torch.Size([1, 512,  H/8,  W/8])
         # f4:  torch.Size([1, 256,  H/4,  W/4])
         multi_scale_features = (f16, f8, f4)
+        return key, shrinkage, selection, multi_scale_features
 
-        # predict segmentation mask for current timestamp
+    def _segment(self, key, selection, multi_scale_features, is_normal_update):
+        '''Compute the segmentation from memory'''
+        # shape [1, ?]
+        memory_readout = self.memory.match_memory(key, selection).unsqueeze(0)
+        # get track masks
+        hidden, _, pred_prob_with_bg = self.model.segment(
+            multi_scale_features, memory_readout, 
+            self.memory.get_hidden(), 
+            h_out=is_normal_update, 
+            strip_bg=False)
+        # pred_prob_with_bg: [ batch, class_id, H, W ] in [0, 1]
+        # remove batch dim
+        pred_prob_with_bg = pred_prob_with_bg[0]
+        pred_prob_no_bg = pred_prob_with_bg[1:]
+        if is_normal_update:
+            self.memory.set_hidden(hidden)
+        return pred_prob_with_bg, pred_prob_no_bg
 
-        pred_prob_no_bg = pred_prob_with_bg = None
-        if need_segment:
-            # shape [1, ?]
-            memory_readout = self.memory.match_memory(key, selection).unsqueeze(0)
-            # get track masks
-            hidden, _, pred_prob_with_bg = self.network.segment(
-                multi_scale_features, memory_readout, 
-                self.memory.get_hidden(), 
-                h_out=is_normal_update, 
-                strip_bg=False)
-            # pred_prob_with_bg: [ batch, class_id, H, W ] in [0, 1]
-            # remove batch dim
-            pred_prob_with_bg = pred_prob_with_bg[0]
-            pred_prob_no_bg = pred_prob_with_bg[1:]
-            if is_normal_update:
-                self.memory.set_hidden(hidden)
-
-        # handle external segmentation mask
-
+    def _match_detection_masks(self, mask, pred_prob_no_bg, pred_prob_with_bg, valid_track_ids=None, key=None):
+        '''Match object detections with minimum IoU'''
         input_track_ids = valid_track_ids
-        if mask is not None:
+        # increase the size of very small masks to make tracking easier
+        if self._dilate_size_threshold:
+            mask = dilate_masks(mask, self._dilation_kernel, self._dilate_size_threshold)
 
-            # match object detections with minimum IoU
+        if valid_track_ids is None:
+            if pred_prob_no_bg is None:
+                assert not self.memory.work_mem.engaged()
+                self.memory.update_track_ids(len(mask), key)
+                input_track_ids = self.memory.track_ids
+            else:
+                pred_mask_no_bg = mask_pred_to_binary(pred_prob_with_bg)[1:]
+                mask, input_track_ids, unmatched_rows, new_rows = assign_masks(
+                    pred_mask_no_bg, mask, pred_prob_no_bg,
+                    self.config['min_iou'],
+                    self.config['allow_create'])
+                if len(new_rows):
+                    # print("unmatched/new rows", unmatched_rows, new_rows, len(mask))
+                    self.memory.update_track_ids(len(mask), key)
+                track_ids = self.memory.track_ids
+                input_track_ids = [track_ids[i] for i in input_track_ids]
 
-            # increase the size of very small masks to make tracking easier
-            if self.dilate_size_threshold:
-                mask = dilate_masks(mask, self.kernel, self.dilate_size_threshold)
+        assert (mask is None) == (input_track_ids is None)
+        return mask, input_track_ids
+    
+    def _valid_mask_predictions(self, mask, pred_prob_no_bg, pred_prob_with_bg, valid_track_ids):
+        '''Combine predicted and detected masks.'''
+        if pred_prob_no_bg is not None:
+            # convert all masks overlapping with ground truth mask to zero
+            pred_prob_no_bg[:, (mask.sum(0) > 0.5)] = 0
+            # shift by 1 because mask/pred_prob_no_bg do not contain background
+            mask = mask.type_as(pred_prob_no_bg)
+            if valid_track_ids is not None:
+                shift_by_one_non_labels = [
+                    i for i in range(pred_prob_no_bg.shape[0]) 
+                    if (i+1) not in valid_track_ids
+                ]
+                # non-labelled objects are copied from the predicted mask
+                mask[shift_by_one_non_labels] = pred_prob_no_bg[shift_by_one_non_labels]
+        # add background back in and convert using softmax
+        pred_prob_with_bg = aggregate(mask, dim=0)
+        return mask, pred_prob_no_bg, pred_prob_with_bg
+    
+    def _update_memory(self, image, key, shrinkage, selection, multi_scale_features, pred_prob_with_bg, is_deep_update):
+        '''Add features to memory and possibly do a full update hidden state.'''
+        # hidden: torch.Size([1, 3, 64, 2, 2])
+        # image segmentation to memory value
+        value, hidden = self.model.encode_value(
+            image, multi_scale_features[0], self.memory.get_hidden(), 
+            pred_prob_with_bg[1:].unsqueeze(0), 
+            is_deep_update=is_deep_update)
+        # save value in memory
+        self.memory.add_memory(
+            key, shrinkage, value, 
+            selection=selection if self._enable_long_term else None)
+        self.last_mem_it = self.curr_it
 
-            if valid_track_ids is None:
-                if pred_prob_no_bg is None:
-                    assert not engaged
-                    self._set_track_ids(len(mask))
-                    input_track_ids = self.track_ids
-                else:
-                    pred_mask_no_bg = mask_pred_to_binary(pred_prob_with_bg)[1:]
-                    mask, input_track_ids, unmatched_rows, new_rows = assign_masks(
-                        pred_mask_no_bg, mask, pred_prob_no_bg)
-                    if len(new_rows):
-                        # print("unmatched/new rows", unmatched_rows, new_rows, len(mask))
-                        self._set_track_ids(len(mask))
-                    input_track_ids = [self.track_ids[i] for i in input_track_ids]
+        if is_deep_update:
+            self.memory.set_hidden(hidden)
+            self.last_deep_update_it = self.curr_it
 
-            # convert input mask
+        log.debug("%s memory update %s: \n%s", 'deep' if is_deep_update else 'normal', self.curr_it, self.memory)
 
-            mask, _ = pad_divide_by(mask, 16)
+    def _update_tracks(self, pred_mask, track_ids, input_track_ids):
+        '''Bookkeeping track detections'''
+        track_ids = np.asarray(track_ids)
+        deleted = self.memory.update_tracks(input_track_ids, self.curr_it)
+        keep = np.array([True]+[i not in deleted for i in track_ids])
+        pred_mask = pred_mask[keep]
+        track_ids = track_ids[keep[1:]]
+        return pred_mask, track_ids
+    
+    def _binarize_mask(self, pred_mask, track_ids):
+        '''Convert logits to argmax binary mask.'''
+        # covert to binary mask
+        if pred_mask.ndim == 4:
+            pred_mask = pred_mask[0]
+        pred_mask_int = torch.argmax(pred_mask, dim=0) - 1
+        pred_ids = torch.unique(pred_mask_int)
+        pred_ids = pred_ids[pred_ids >= 0]
+        pred_mask = pred_ids[:, None, None] == pred_mask_int[None]
 
-            if pred_prob_no_bg is not None:
-                # convert all masks overlapping with ground truth mask to zero
-                pred_prob_no_bg[:, (mask.sum(0) > 0.5)] = 0
-                # shift by 1 because mask/pred_prob_no_bg do not contain background
-                mask = mask.type_as(pred_prob_no_bg)
-                if valid_track_ids is not None:
-                    shift_by_one_non_labels = [
-                        i for i in range(pred_prob_no_bg.shape[0]) 
-                        if (i+1) not in valid_track_ids
-                    ]
-                    # non-labelled objects are copied from the predicted mask
-                    mask[shift_by_one_non_labels] = pred_prob_no_bg[shift_by_one_non_labels]
+        # what should the output format be?
+        pred_ids = pred_ids.cpu().numpy()
+        track_ids = track_ids[pred_ids]
+        return pred_mask, track_ids
 
-            # add background back in and convert using softmax
-            pred_prob_with_bg = aggregate(mask, dim=0)
 
-            # also create new hidden states
-            self.memory.create_hidden_state(len(self.track_ids), key)
-
-        # save to memory
-
-        if is_mem_frame:
-            # hidden: torch.Size([1, 3, 64, 2, 2])
-            # image segmentation to memory value
-            value, hidden = self.network.encode_value(
-                image, f16, self.memory.get_hidden(), 
-                pred_prob_with_bg[1:].unsqueeze(0), 
-                is_deep_update=is_deep_update)
-            # save value in memory
-            self.memory.add_memory(
-                key, shrinkage, value, self.track_ids, 
-                selection=selection if self.enable_long_term else None)
-            self.last_mem_ti = self.curr_ti
-
-            if is_deep_update:
-                self.memory.set_hidden(hidden)
-                self.last_deep_update_ti = self.curr_ti
-
-        # get outputs
-        pred_mask = unpad(pred_prob_with_bg, pad)
-        track_ids = np.asarray(self.track_ids)
-        input_track_ids = np.asarray(input_track_ids) if input_track_ids is not None else None
-
-        # handle track deletions
-        if input_track_ids is not None:
-            _, deleted = self.Track.update_tracks(
-                self.tracks, input_track_ids, self.curr_ti,
-                n_init=self.tentative_frame_count,
-                max_age=self.track_max_age)
-            deleted and print('deleted', deleted)
-            keep = np.array([True]+[i not in deleted for i in track_ids])
-            pred_mask = pred_mask[keep]
-            track_ids = track_ids[keep[1:]]
-            for i in deleted:
-                self.delete_object_id(i)
-
-        # convert probabilities to binary masks using argmax
-        if binarize_mask:
-            # covert to binary mask
-            if pred_mask.ndim == 4:
-                pred_mask = pred_mask[0]
-            pred_mask_int = torch.argmax(pred_mask, dim=0) - 1
-            pred_ids = torch.unique(pred_mask_int)
-            pred_ids = pred_ids[pred_ids >= 0]
-            pred_mask = pred_ids[:, None, None] == pred_mask_int[None]
-
-            # what should the output format be?
-            pred_ids = pred_ids.cpu().numpy()
-            track_ids = track_ids[pred_ids]
-
-        self.curr_ti += 1
-        # pred_prob_with_bg: [1 + num_objects, H, W]
-        # pred_mask: [num_objects, H, W] if binarize_mask else [1 + num_objects, H, W]
-        return pred_mask, track_ids, input_track_ids
-
+    # -------------------------- User convenience utils -------------------------- #
 
     def match_iou(self, xmem_mask, other_mask, min_iou=0.4):
         track_ids, other_ids = self.iou_assignment(xmem_mask, other_mask, min_iou)
-        track_ids = np.array(self.track_ids, dtype=int)[track_ids]
+        track_ids = np.array(self.memory.track_ids, dtype=int)[track_ids]
         return track_ids, other_ids
     
     @staticmethod
@@ -270,6 +329,10 @@ class XMem(torch.nn.Module):
             track_ids = track_ids[cost > min_iou]
             other_ids = other_ids[cost > min_iou]
         return track_ids, other_ids
+    
+    @staticmethod
+    def masks_to_boxes(masks):
+        return masks_to_boxes(masks)
 
 
 
@@ -287,7 +350,25 @@ def mask_iou(a, b, eps=1e-7):
     return 1. * overlap.sum((2, 3)) / (union.sum((2, 3)) + eps)
 
 
-def assign_masks(binary_masks, new_masks, pred_mask=None, min_iou=0.4):
+def assign_masks(binary_masks, new_masks, pred_mask=None, min_iou=0.4, allow_create=True):
+    '''Assign XMem predicted masks to user-provided masks.
+    
+    Arguments:
+        binary_masks (torch.Tensor): The binary masks given by XMem.
+        new_masks (torch.Tensor): The binary masks given by you.
+        pred_mask (torch.Tensor): The probabilistic masks given by XMem.
+        min_iou (float): The minimum IoU allowed for mask assignment.
+    
+    Returns:
+        full_masks (torch.Tensor): The merged masks.
+        input_track_ids (list): The track indices corresponding to each input mask. If allow_create=False, these values can be None.
+        unmatched_tracks (list): Tracks that did not have associated matches.
+        new_tracks (torch.Tensor): Track indices that were added.
+
+    NOTE: returned track IDs correspond to the track index in ``binary_mask``. If you have
+          another index of tracks (e.g. if you manage track deletions) you need to re-index
+          those externally.
+    '''
     iou = mask_iou(binary_masks, new_masks)    
     iou = iou.cpu().numpy()
     rows, cols = linear_sum_assignment(iou, maximize=True)
@@ -300,7 +381,7 @@ def assign_masks(binary_masks, new_masks, pred_mask=None, min_iou=0.4):
     # new detections without a matching track
     unmatched_cols = sorted(set(range(len(new_masks))) - set(cols))
     # create indices for new tracks
-    new_rows = torch.arange(len(unmatched_cols)) + len(binary_masks)
+    new_rows = torch.arange(len(unmatched_cols) if allow_create else 0) + len(binary_masks)
 
     # merge masks - create blank array with the right size
     n = len(binary_masks) + len(new_rows)
@@ -320,11 +401,13 @@ def assign_masks(binary_masks, new_masks, pred_mask=None, min_iou=0.4):
         full_masks[new_rows] = new_masks[unmatched_cols]
 
     # this is the track_ids corresponding to the input masks
+    new_rows_list = new_rows.tolist()
+    if not allow_create:
+        new_rows_list = [None]*len(unmatched_cols)
     input_track_ids = [
         r for c, r in sorted(zip(
             (*cols, *unmatched_cols), 
-            (*rows, *new_rows.tolist())))]
-
+            (*rows, *new_rows_list)))]
     return full_masks, input_track_ids, unmatched_rows, new_rows
 
 

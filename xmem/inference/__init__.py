@@ -1,4 +1,4 @@
-from .inference_core import XMem
+from .inference_core import XMem, log
 from .memory_manager import MemoryManager
 from .kv_memory_store import KeyValueMemoryStore
 from .track import Track

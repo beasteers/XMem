@@ -1,9 +1,13 @@
 import torch
+import logging
 import warnings
 
 from .kv_memory_store import KeyValueMemoryStore, splice
 from xmem.model.memory_util import *
 from .config import DEFAULT_CONFIG
+from .track import Track
+
+log = logging.getLogger('xmem:MemoryManager')
 
 class MemoryManager:
     """
@@ -11,18 +15,11 @@ class MemoryManager:
     """
     min_work_elements = None
     max_work_elements = None
-    def __init__(self, config=None):
-        config = config or DEFAULT_CONFIG
-        self.hidden_dim = config['hidden_dim']
-        self.top_k = config['top_k']
-
+    def __init__(self, config=None, Track=Track, track_offset=0):
+        self.config = config = config or DEFAULT_CONFIG
         self.enable_long_term = config['enable_long_term']
         self.enable_long_term_usage = config['enable_long_term_count_usage']
-        if self.enable_long_term:
-            self.max_mt_frames = config['max_mid_term_frames']
-            self.min_mt_frames = config['min_mid_term_frames']
-            self.num_prototypes = config['num_prototypes']
-            self.max_long_elements = config['max_long_term_elements']
+        self.Track = Track
 
         # dimensions will be inferred from input later
         self.CK = self.CV = None
@@ -32,6 +29,12 @@ class MemoryManager:
         # B x num_objects x CH x H x W
         self.hidden = None
 
+        # object tracks
+        self.tracks = {}
+        self.track_ids = []
+        self.track_offset = track_offset or 0
+
+        # memory
         self.work_mem = KeyValueMemoryStore(count_usage=self.enable_long_term)
         if self.enable_long_term:
             self.long_mem = KeyValueMemoryStore(count_usage=self.enable_long_term_usage)
@@ -41,7 +44,8 @@ class MemoryManager:
             f'MemoryManager(CK={self.CK}, CV={self.CV}, H={self.H}, W={self.W}, '
             f'\n  work_mem_full={self.work_mem.size}/{self.max_work_elements},'
             f'\n  work_mem={self.work_mem},'
-            f'\n  long_mem={self.long_mem})')
+            f'\n  long_mem={self.long_mem},'
+            f'\n  tracks={self.track_ids})')
 
     @property
     def object_ids(self):
@@ -53,18 +57,19 @@ class MemoryManager:
 
     def update_config(self, config):
         self.H = None
-        self.hidden_dim = config['hidden_dim']
-        self.top_k = config['top_k']
-
+        self.config = config
         assert self.enable_long_term == config['enable_long_term'], 'cannot update this'
         assert self.enable_long_term_usage == config['enable_long_term_count_usage'], 'cannot update this'
 
-        self.enable_long_term_usage = config['enable_long_term_count_usage']
-        if self.enable_long_term:
-            self.max_mt_frames = config['max_mid_term_frames']
-            self.min_mt_frames = config['min_mid_term_frames']
-            self.num_prototypes = config['num_prototypes']
-            self.max_long_elements = config['max_long_term_elements']
+    def delete_object_id(self, track_id):
+        i = self.track_ids.index(track_id)
+        self.work_mem.delete(track_id)
+        self.long_mem.delete(track_id)
+        self.hidden = torch.cat([self.hidden[:,:i], self.hidden[:,i+1:]], 1)
+        del self.track_ids[i]
+        # del self.tracks[track_id]
+
+    # ----------------------------- Memory management ---------------------------- #
 
     def _readout(self, affinity, v):
         # this function is for a single object group
@@ -113,7 +118,7 @@ class MemoryManager:
                 sim = torch.cat([long_sim, sim], 1)
 
             # get affinity
-            aff, usage = do_softmax(sim, top_k=self.top_k, inplace=False, return_usage=True)
+            aff, usage = do_softmax(sim, top_k=self.config['top_k'], inplace=False, return_usage=True)
             affinity[gi] = aff
             usages[gi] = usage
 
@@ -154,7 +159,8 @@ class MemoryManager:
 
         return all_readout_mem.view(all_readout_mem.shape[0], self.CV, h, w)
 
-    def add_memory(self, key, shrinkage, value, objects, selection=None):
+    def add_memory(self, key, shrinkage, value, selection=None):
+        objects = self.track_ids
         # key: 1*C*H*W
         # value: 1*num_objects*C*H*W
         # objects contain a list of object indices
@@ -163,8 +169,8 @@ class MemoryManager:
             self.HW = self.H*self.W
             if self.enable_long_term:
                 # convert from num. frames to num. nodes
-                self.min_work_elements = self.min_mt_frames*self.HW
-                self.max_work_elements = self.max_mt_frames*self.HW
+                self.min_work_elements = self.config['min_mid_term_frames'] * self.HW
+                self.max_work_elements = self.config['max_mid_term_frames'] * self.HW
 
         # key:   1*C*N
         # value: num_objects*C*N
@@ -189,41 +195,82 @@ class MemoryManager:
             # Do memory compressed if needed
             if self.work_mem.size >= self.max_work_elements:
                 # Remove obsolete features if needed
-                if self.long_mem.size >= (self.max_long_elements-self.num_prototypes):
-                    self.long_mem.remove_obsolete_features(self.max_long_elements-self.num_prototypes)
+                max_long_elements = self.config['max_long_term_elements']
+                num_prototypes = self.config['num_prototypes']
+                if self.long_mem.size >= (max_long_elements-num_prototypes):
+                    self.long_mem.remove_obsolete_features(max_long_elements-num_prototypes)
                     
                 self.compress_features()
 
-    def delete_object_id(self, track_id, i):
-        # print(self.hidden.shape, track_id, i)
-        self.work_mem.delete(track_id)
-        self.long_mem.delete(track_id)
-        self.hidden = (
-            torch.cat([self.hidden[:,:i], self.hidden[:,i+1:]], 1)
-            # if i < self.hidden.shape[1]-1 else
-            # self.hidden[:,:i] if i else 
-            # self.hidden[:,i+1:]
-        )
-        # print(self.hidden.shape)
+    # -------------------------- Hidden state management ------------------------- #
 
-    def create_hidden_state(self, n, sample_key):
+    @staticmethod
+    def _resize_hidden_state(hidden, n, hidden_dim, sample_key):
         # n is the TOTAL number of objects
         h, w = sample_key.shape[-2:]
-        if self.hidden is None:
-            self.hidden = torch.zeros((1, n, self.hidden_dim, h, w), device=sample_key.device)
-        elif self.hidden.shape[1] != n:
-            self.hidden = torch.cat([
-                self.hidden, 
-                torch.zeros((1, n-self.hidden.shape[1], self.hidden_dim, h, w), device=sample_key.device)
+        if hidden is None:
+            hidden = torch.zeros((1, n, hidden_dim, h, w), device=sample_key.device)
+        elif hidden.shape[1] != n:
+            hidden = torch.cat([
+                hidden, 
+                torch.zeros((1, n-hidden.shape[1], hidden_dim, h, w), device=sample_key.device)
             ], 1)
+        assert hidden.shape[1] == n
+        return hidden
+    
+    def resize_hidden_state(self, key):
+        self.hidden = self._resize_hidden_state(self.hidden, len(self.track_ids), self.config['hidden_dim'], key)
 
-        assert self.hidden.shape[1] == n
+    def create_hidden_state(self, desired_size, sample_key):
+        self.hidden = self._resize_hidden_state(
+            self.hidden, desired_size, self.config['hidden_dim'], sample_key)
 
     def set_hidden(self, hidden):
         self.hidden = hidden
 
     def get_hidden(self):
         return self.hidden
+    
+    # ----------------------------- Track management ----------------------------- #
+
+    def update_track_ids(self, track_ids, key=None):
+        # log.debug('update track IDs: %s', track_ids)
+        if isinstance(track_ids, int):
+            n = track_ids - len(self.track_ids)
+            if n < 0: 
+                raise RuntimeError("You cant reduce label count like this.")
+            elif n == 0:
+                return 
+            track_ids = self.track_ids + [self.track_offset + i for i in range(n)]
+        self.track_ids = track_ids
+        self.track_offset = max(max(self.track_ids) + 1, self.track_offset)
+        
+        new = set(track_ids) - set(self.track_ids)
+        if new:
+            log.info(f'new tracks: {list(new)} - added {len(new)}. {len(track_ids)} total.')
+            log.debug('track IDs: %s', track_ids)
+
+        # create new hidden states in case we added new object tracks
+        if key is not None:
+            self.resize_hidden_state(key)
+
+    def update_tracks(self, input_track_ids, timestamp, **kw):
+        '''Bookkeeping track detections'''
+        # tracks
+        track_kw = {
+            'n_init': self.config['tentative_frames'],
+            'max_age': self.config['max_age'],
+            **kw
+        }
+
+        _, deleted = self.Track.update_tracks(self.tracks, input_track_ids, timestamp, **track_kw)
+        for tid in deleted:
+            self.delete_object_id(tid)
+        if deleted:
+            log.info(f'deleted tracks: {deleted}')
+        return deleted
+
+    # ------------------- Memory compression and consolidation ------------------- #
 
     def compress_features(self):
         HW = self.HW
@@ -255,7 +302,7 @@ class MemoryManager:
         N = candidate_key.shape[-1]
 
         # find the indices with max usage
-        _, max_usage_indices = torch.topk(usage, k=self.num_prototypes, dim=-1, sorted=True)
+        _, max_usage_indices = torch.topk(usage, k=self.config['num_prototypes'], dim=-1, sorted=True)
         prototype_indices = max_usage_indices.flatten()
 
         prototype_key = candidate_key[:, :, prototype_indices]
