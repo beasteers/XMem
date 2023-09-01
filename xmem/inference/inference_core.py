@@ -15,8 +15,6 @@ from torchvision.ops import masks_to_boxes
 
 from scipy.optimize import linear_sum_assignment
 
-from IPython import embed
-
 
 log = logging.getLogger('XMem')
 
