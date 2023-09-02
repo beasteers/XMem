@@ -2,12 +2,12 @@ dependencies = ['torch', 'scipy']
 
 
 
-def tracker(config=None, checkpoint_path=None):
+def tracker(config=None, checkpoint_path=None, map_location=None):
     """A full-blown XMem tracker.
     """
     from xmem import XMem
     # Call the model, load pretrained weights
-    model = XMem(config or {}, checkpoint_path).eval()
+    model = XMem(config or {}, checkpoint_path, map_location=map_location).eval()
     return model
 
 

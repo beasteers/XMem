@@ -20,10 +20,14 @@ from scipy.optimize import linear_sum_assignment
 
 log = logging.getLogger('XMem')
 
-device = 'cuda'
+device = (
+    'cuda' if torch.cuda.is_available() else
+    'mps' if torch.mps.is_available() else 
+    'cpu'
+)
 
 class XMem(torch.nn.Module):
-    def __init__(self, config, checkpoint_path=None, map_location=None, model=None, Track=Track):
+    def __init__(self, config, checkpoint_path=None, map_location=device, model=None, Track=Track):
         super().__init__()
         config = get_config(config)
         if model is None:
