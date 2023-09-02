@@ -7,5 +7,5 @@ setuptools.setup(
     long_description=open('README.md').read().strip(),
     long_description_content_type='text/markdown',
     packages=setuptools.find_packages(),
-    install_requires=['torch'],
+    install_requires=['torch', 'scipy', 'numpy'],
     extras_require={})
