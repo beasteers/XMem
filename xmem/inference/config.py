@@ -14,9 +14,6 @@ DEFAULT_CONFIG = {
     'min_mid_term_frames': 5,
     'max_mid_term_frames': 10,
     'max_long_term_elements': 10000,
-    # these are used for very small masks e.g. toothpicks
-    'dilate_size_threshold': 0,
-    'dilation_kernel_size': 5,
     # mask matching options
     'min_iou': 0.4,
     'allow_create': True,

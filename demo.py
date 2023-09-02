@@ -14,8 +14,7 @@ import numpy as np
 import torch
 import supervision as sv
 
-from xmem.inference import XMem
-from xmem.inference.interact.interactive_utils import image_to_torch
+from xmem.inference import XMem, log
 from xmem.util.box_annotator import BoxAnnotator
 from torchvision.ops import masks_to_boxes
 
@@ -41,10 +40,17 @@ xmem_config = {
 }
 
 
+
+
 import ipdb
 @ipdb.iex
 @torch.no_grad()
-def main(src, vocab='lvis', out_path='xmem_output.mp4', detect_every=1, skip_frames=0, fps_down=1, size=480):
+def mainx(*a, **kw):
+    return main(*a, **kw)
+
+def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_output.mp4', detect_every=1, skip_frames=0, fps_down=1, size=480, limit=None):
+    if untracked_vocab:
+        vocab = vocab + untracked_vocab
     
     # object detector
     detic_model = Detic(vocab, conf_threshold=0.5, masks=True).to(device)
@@ -61,25 +67,37 @@ def main(src, vocab='lvis', out_path='xmem_output.mp4', detect_every=1, skip_fra
 
     # video read-write loop
     video_info, WH = get_video_info(src, size, fps_down, ncols=2)
+    afps = video_info.fps / fps_down
+    i_detect = int(detect_every*video_info.og_fps//fps_down)
+    print('detecting every', i_detect, detect_every, afps, detect_every%(1/afps))
+    
     with sv.VideoSink(target_path=out_path, video_info=video_info) as s:
         for i, frame in enumerate(tqdm.tqdm(sv.get_video_frames_generator(src))):
             if i < skip_frames or i%fps_down: continue
+            if limit and i > limit: break
 
             frame = cv2.resize(frame, WH)
 
             # run detic
-            detections = mask = None
-            if not i % int(detect_every*video_info.og_fps) or i == skip_frames:
+            detections = det_mask = None
+            if not i % i_detect or i == skip_frames:
                 # get object detections
                 outputs = detic_model(frame)
-                mask = outputs["instances"].pred_masks.int()
+                det_mask = outputs["instances"].pred_masks.int()
 
                 # draw detic
                 detect_out_frame, detections = draw.draw_detectron2(frame, outputs, detic_model.labels)
+                log.info(f'Detected ({i}|{i_detect}): {detic_model.labels[detections.class_id]}')
+
+                if untracked_vocab:
+                    keep = [l not in untracked_vocab for l in detic_model.labels[detections.class_id]]
+                    det_mask = det_mask[keep]
+                    detections = detections[keep]
+                
+                det_mask = xmem.dilate_masks(det_mask)
 
             # run xmem
-            X, _ = image_to_torch(frame, device=device)
-            pred_mask, track_ids, input_track_ids = xmem(X, mask, only_confirmed=True)
+            pred_mask, track_ids, input_track_ids = xmem(frame, det_mask, only_confirmed=True)
 
             # update label counts
             if detections is not None:
@@ -91,7 +109,6 @@ def main(src, vocab='lvis', out_path='xmem_output.mp4', detect_every=1, skip_fra
 
             # write frame to file
             s.write_frame(np.concatenate([track_out_frame, detect_out_frame], axis=1))
-
 
     print("wrote to:", out_path)
 
@@ -179,9 +196,40 @@ def get_video_info(src, size, fps_down=1, nrows=1, ncols=1):
     print(f"Input Video {src}\nsize: {WH}  fps: {video_info.fps}")
     return video_info, WH
 
+def main_profile(*a, **kw):
+    # from xmem.model.network import XMem as XMemModel
+    # from xmem.model.modules import Decoder
+    # from line_profiler import LineProfiler
+    # lp = LineProfiler()
+    # lp.add_function(XMem.forward)
+    # lp.add_function(Decoder.forward)
+    # lp.add_function(main)
+    # try:
+    #     lp(mainx)(*a, **kw)
+    # finally:
+    #     lp.print_stats()
+
+    from pyinstrument import Profiler
+    prof = Profiler(async_mode='disabled')
+    try:
+        with prof:
+            mainx(*a, **kw)
+    finally:
+        prof.print()
+
+    # import torch.profiler
+    # prof = torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], 
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/profile'),
+    #     schedule=torch.profiler.schedule(skip_first=10, wait=60, warmup=10, active=20, repeat=5),
+    #     record_shapes=True)
+    # try:
+    #     mainx(*a, **kw)
+    # finally:
+    #     print(prof.key_averages(group_by_stack_n=5).table(sort_by='self_cpu_time_total', row_limit=5))
 
 if __name__ == '__main__':
     import fire
     logging.basicConfig(level=logging.DEBUG)
     with logging_redirect_tqdm():
-        fire.Fire(main)
+        fire.Fire(main_profile)

@@ -3,11 +3,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import logging
+import functools
 
 from xmem.inference.track import Track
 from xmem.inference.memory_manager import MemoryManager
 from xmem.model.network import XMem as XMemModel
 from xmem.model.aggregate import aggregate
+from xmem.dataset.range_transform import im_normalization as norm
 from xmem.util.tensor_util import pad_divide_by, unpad
 from .config import get_config
 from ..checkpoint import ensure_checkpoint
@@ -21,7 +23,6 @@ log = logging.getLogger('XMem')
 device = 'cuda'
 
 class XMem(torch.nn.Module):
-    next_label = 0
     def __init__(self, config, checkpoint_path=None, map_location=None, model=None, Track=Track):
         super().__init__()
         config = get_config(config)
@@ -32,6 +33,7 @@ class XMem(torch.nn.Module):
 
         self.model = model
         self.config = config
+        self._device_param = torch.nn.Parameter(torch.empty(0))
 
         # box tracks
         self.Track = Track
@@ -65,17 +67,14 @@ class XMem(torch.nn.Module):
         self._enable_long_term = config['enable_long_term']
         self._deep_update_sync = (self._deep_update_every < 0)  # synchronize deep update with memory frame
 
-        # a kernel to make tiny segmentatation maps a bit bigger (e.g. toothpicks)
-        self._dilate_size_threshold = config.get('dilate_size_threshold')
-        kernel_size = config.get('dilation_kernel_size') or 0
-        self._dilation_kernel = np.ones((kernel_size, kernel_size), dtype=np.int32)
-
     def forward(self, image, mask=None, valid_track_ids=None, no_update=False, binarize_mask=True, only_confirmed=False, only_visible=True):
         
         # ----------------------------- preprocess image ----------------------------- #
 
         # image: [3, H, W]
         # mask: [num_objects, H, W] or None
+        if not torch.is_tensor(image):
+            image = norm(torch.from_numpy(image.transpose(2, 0, 1)).float().to(self._device_param.device)/255)
         image, pad = pad_divide_by(image, 16)  # image should be divisible by 16
         image = image.unsqueeze(0) # add the batch dimension
 
@@ -173,12 +172,6 @@ class XMem(torch.nn.Module):
             pred_mask = pred_mask[confirmed]
             track_ids = track_ids[confirmed]
 
-        # filter out segmentation masks where the entire mask is zeros
-        if only_visible:
-            visible_tracks = pred_mask.any(1).any(1).cpu().numpy()
-            pred_mask = pred_mask[visible_tracks]
-            track_ids = track_ids[visible_tracks]
-
         self.curr_it += 1
         # pred_prob_with_bg: [1 + num_objects, H, W]
         # pred_mask: [num_objects, H, W] if binarize_mask else [1 + num_objects, H, W]
@@ -223,10 +216,6 @@ class XMem(torch.nn.Module):
     def _match_detection_masks(self, mask, pred_prob_no_bg, pred_prob_with_bg, valid_track_ids=None, key=None):
         '''Match object detections with minimum IoU'''
         input_track_ids = valid_track_ids
-        # increase the size of very small masks to make tracking easier
-        if self._dilate_size_threshold:
-            mask = dilate_masks(mask, self._dilation_kernel, self._dilate_size_threshold)
-
         if valid_track_ids is None:
             if pred_prob_no_bg is None:
                 assert not self.memory.work_mem.engaged()
@@ -269,15 +258,18 @@ class XMem(torch.nn.Module):
         '''Add features to memory and possibly do a full update hidden state.'''
         # hidden: torch.Size([1, 3, 64, 2, 2])
         # image segmentation to memory value
+        torch.cuda.synchronize()
         value, hidden = self.model.encode_value(
             image, multi_scale_features[0], self.memory.get_hidden(), 
             pred_prob_with_bg[1:].unsqueeze(0), 
             is_deep_update=is_deep_update)
+        torch.cuda.synchronize()
         # save value in memory
         self.memory.add_memory(
             key, shrinkage, value, 
             selection=selection if self._enable_long_term else None)
         self.last_mem_it = self.curr_it
+        torch.cuda.synchronize()
 
         if is_deep_update:
             self.memory.set_hidden(hidden)
@@ -293,20 +285,27 @@ class XMem(torch.nn.Module):
         pred_mask = pred_mask[keep]
         track_ids = track_ids[keep[1:]]
         return pred_mask, track_ids
-    
+
     def _binarize_mask(self, pred_mask, track_ids):
         '''Convert logits to argmax binary mask.'''
         # covert to binary mask
+
+        # remove batch dimension
         if pred_mask.ndim == 4:
             pred_mask = pred_mask[0]
+
+        # get the winning index
         pred_mask_int = torch.argmax(pred_mask, dim=0) - 1
-        pred_ids = torch.unique(pred_mask_int)
-        pred_ids = pred_ids[pred_ids >= 0]
+        pred_ids = torch.arange(len(pred_mask)-1, device=pred_mask.device)
         pred_mask = pred_ids[:, None, None] == pred_mask_int[None]
 
+        # filter empty
+        present = pred_mask.any(2).any(1)#.cpu().numpy()
+        pred_mask = pred_mask[present]
+        pred_ids = pred_ids[present]
+
         # what should the output format be?
-        pred_ids = pred_ids.cpu().numpy()
-        track_ids = track_ids[pred_ids]
+        track_ids = track_ids[pred_ids.cpu().numpy()]
         return pred_mask, track_ids
 
 
@@ -332,6 +331,9 @@ class XMem(torch.nn.Module):
     def masks_to_boxes(masks):
         return masks_to_boxes(masks)
 
+    @staticmethod
+    def dilate_masks(masks, kernel=5, rel_area=0.01):
+        return dilate_masks(masks, kernel, rel_area)
 
 
 def mask_pred_to_binary(x):
@@ -409,9 +411,18 @@ def assign_masks(binary_masks, new_masks, pred_mask=None, min_iou=0.4, allow_cre
     return full_masks, input_track_ids, unmatched_rows, new_rows
 
 
-def dilate_masks(mask, kernel, rel_area=0.01):
-    # dilate masks whose overall area is below a certain value
-    # this makes it easier for xmem to track those objects
+@functools.lru_cache(3)
+def _get_kernel(kernel_size):
+    if isinstance(kernel_size, np.ndarray):
+        return kernel_size
+    return np.ones((kernel_size, kernel_size), dtype=np.int32)
+
+
+def dilate_masks(mask, kernel=5, rel_area=0.01):
+    '''dilate masks whose overall area is below a certain value. 
+    this makes it easier for xmem to track those objects (e.g. toothpicks).
+    '''
+    kernel = _get_kernel(kernel)
     for i, size in enumerate(mask.sum((1, 2))):
         if size < rel_area * mask.shape[1] * mask.shape[2]:
             # print("dilating", labels[i], mask[i].shape)
