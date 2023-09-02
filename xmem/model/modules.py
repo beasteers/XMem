@@ -230,19 +230,17 @@ class Decoder(nn.Module):
         batch_size, num_objects = memory_readout.shape[:2]
 
         if self.hidden_update is not None:
-            g16 = self.fuser(f16, torch.cat([memory_readout, hidden_state], 2))
-        else:
-            g16 = self.fuser(f16, memory_readout)
+            memory_readout = torch.cat([memory_readout, hidden_state], 2)
 
+        g16 = self.fuser(f16, memory_readout)
         g8 = self.up_16_8(f8, g16)
         g4 = self.up_8_4(f4, g8)
         logits = self.pred(F.relu(g4.flatten(start_dim=0, end_dim=1)))
 
+        hidden_state = None
         if h_out and self.hidden_update is not None:
             g4 = torch.cat([g4, logits.view(batch_size, num_objects, 1, *logits.shape[-2:])], 2)
             hidden_state = self.hidden_update([g16, g8, g4], hidden_state)
-        else:
-            hidden_state = None
         
         logits = F.interpolate(logits, scale_factor=4, mode='bilinear', align_corners=False)
         logits = logits.view(batch_size, num_objects, *logits.shape[-2:])
