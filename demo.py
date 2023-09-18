@@ -72,7 +72,7 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_output.mp4', de
     print('detecting every', i_detect, detect_every, afps, detect_every%(1/afps))
     
     with sv.VideoSink(target_path=out_path, video_info=video_info) as s:
-        for i, frame in enumerate(tqdm.tqdm(sv.get_video_frames_generator(src))):
+        for i, frame in enumerate(tqdm.tqdm(sv.get_video_frames_generator(src), total=video_info.total_frames)):
             if i < skip_frames or i%fps_down: continue
             if limit and i > limit: break
 
@@ -80,7 +80,7 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_output.mp4', de
 
             # run detic
             detections = det_mask = None
-            if not i % i_detect or i == skip_frames:
+            if i_detect and (not i % i_detect or detect_out_frame is None):
                 # get object detections
                 outputs = detic_model(frame)
                 det_mask = outputs["instances"].pred_masks.int()
@@ -90,7 +90,7 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_output.mp4', de
                 log.info(f'Detected ({i}|{i_detect}): {detic_model.labels[detections.class_id]}')
 
                 if untracked_vocab:
-                    keep = [l not in untracked_vocab for l in detic_model.labels[detections.class_id]]
+                    keep = np.array([l not in untracked_vocab for l in detic_model.labels[detections.class_id]])
                     det_mask = det_mask[keep]
                     detections = detections[keep]
                 

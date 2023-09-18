@@ -61,13 +61,18 @@ class MemoryManager:
         assert self.enable_long_term == config['enable_long_term'], 'cannot update this'
         assert self.enable_long_term_usage == config['enable_long_term_count_usage'], 'cannot update this'
 
-    def delete_object_id(self, track_id):
+    def delete_track(self, track_id):
         i = self.track_ids.index(track_id)
         self.work_mem.delete(track_id)
         self.long_mem.delete(track_id)
         self.hidden = torch.cat([self.hidden[:,:i], self.hidden[:,i+1:]], 1)
         del self.track_ids[i]
         # del self.tracks[track_id]
+
+    def delete_except(self, track_ids):
+        for track_id in set(self.track_ids) - set(track_ids):
+            self.delete_object_id(track_id)
+            # TODO: could be more efficient but meh
 
     # ----------------------------- Memory management ---------------------------- #
 
