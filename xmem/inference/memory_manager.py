@@ -68,10 +68,11 @@ class MemoryManager:
         self.hidden = torch.cat([self.hidden[:,:i], self.hidden[:,i+1:]], 1)
         del self.track_ids[i]
         # del self.tracks[track_id]
+    delete_object_id = delete_track
 
     def delete_except(self, track_ids):
         for track_id in set(self.track_ids) - set(track_ids):
-            self.delete_object_id(track_id)
+            self.delete_track(track_id)
             # TODO: could be more efficient but meh
 
     # ----------------------------- Memory management ---------------------------- #
@@ -270,7 +271,7 @@ class MemoryManager:
 
         _, deleted = self.Track.update_tracks(self.tracks, input_track_ids, timestamp, **track_kw)
         for tid in deleted:
-            self.delete_object_id(tid)
+            self.delete_track(tid)
         if deleted:
             log.info(f'deleted tracks: {deleted}')
         return deleted

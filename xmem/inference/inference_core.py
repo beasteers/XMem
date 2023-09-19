@@ -111,7 +111,7 @@ class XMem(torch.nn.Module):
         # -------------------------- check memory conditions ------------------------- #
 
         is_mem_frame = not no_update and self._is_mem_frame(mask)
-        is_deep_update = not no_update and self._is_deep_update(mask)
+        is_deep_update = not no_update and self._is_deep_update(is_mem_frame)
         need_segment = self._needs_segment(input_track_ids)
 
         # ---------------------------- encode and segment ---------------------------- #
@@ -167,7 +167,7 @@ class XMem(torch.nn.Module):
 
         # only return tracks that have been confirmed by multiple detections
         if only_confirmed:
-            pred_mask, track_ids = self._filter_confirmed(pred_mask, confirmed)
+            pred_mask, track_ids = self._filter_confirmed(pred_mask, track_ids)
 
         self.curr_it += 1
         return pred_mask, track_ids, input_track_ids
@@ -280,8 +280,8 @@ class XMem(torch.nn.Module):
     
     def _valid_mask_predictions(self, mask, pred_prob_with_bg, valid_track_ids):
         '''Combine predicted and detected masks.'''
-        pred_prob_no_bg = pred_prob_with_bg[1:]
-        if pred_prob_no_bg is not None:
+        if pred_prob_with_bg is not None:
+            pred_prob_no_bg = pred_prob_with_bg[1:]
             # convert all masks overlapping with ground truth mask to zero
             pred_prob_no_bg[:, (mask.sum(0) > 0.5)] = 0
             # shift by 1 because mask/pred_prob_no_bg do not contain background

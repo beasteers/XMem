@@ -46,8 +46,8 @@ def assign_masks(pred_prob_with_bg, new_masks, min_iou=0.4, allow_create=True):
     pred_masks = pred_prob_with_bg[1:]  # drop background
     
     # compute assignment
-    iou = mask_iou(binary_masks, new_masks)    
-    iou = iou.cpu().numpy()
+    cost = mask_iou(binary_masks, new_masks)    
+    cost = cost.cpu().numpy()
     rows, cols = linear_sum_assignment(cost, maximize=True)
     xcost = cost[rows, cols]
     rows = rows[xcost > min_iou]
