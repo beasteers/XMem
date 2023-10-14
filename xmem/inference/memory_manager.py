@@ -7,7 +7,7 @@ from xmem.model.memory_util import *
 from .config import DEFAULT_CONFIG
 from .track import Track
 
-log = logging.getLogger('xmem:MemoryManager')
+log = logging.getLogger('XMem')
 
 class MemoryManager:
     """
@@ -31,6 +31,7 @@ class MemoryManager:
 
         # object tracks
         self.tracks = {}
+        self.deleted_tracks = {}
         self.track_ids = []
         self.track_offset = track_offset or 0
 
@@ -40,12 +41,16 @@ class MemoryManager:
             self.long_mem = KeyValueMemoryStore(count_usage=self.enable_long_term_usage)
 
     def __str__(self) -> str:
+        tracks = [
+            f'!{i}' if i not in self.tracks else 
+            f'{i}?' if self.tracks[i].is_tentative() else 
+            f'{i}' for i in self.track_ids]
         return (
             f'MemoryManager(CK={self.CK}, CV={self.CV}, H={self.H}, W={self.W}, '
             f'\n  work_mem_full={self.work_mem.size}/{self.max_work_elements},'
             f'\n  work_mem={self.work_mem},'
             f'\n  long_mem={self.long_mem},'
-            f'\n  tracks={self.track_ids})')
+            f'\n  tracks=[{", ".join(tracks)}])')
 
     @property
     def object_ids(self):
@@ -67,6 +72,8 @@ class MemoryManager:
         self.long_mem.delete(track_id)
         self.hidden = torch.cat([self.hidden[:,:i], self.hidden[:,i+1:]], 1)
         del self.track_ids[i]
+        if track_id in self.tracks:
+            self.deleted_tracks[track_id] = self.tracks.pop(track_id)
         # del self.tracks[track_id]
     delete_object_id = delete_track
 
@@ -167,7 +174,7 @@ class MemoryManager:
 
     def add_memory(self, key, shrinkage, value, selection=None):
         objects = self.track_ids
-        # key: 1*C*H*W
+        # key: 1*C*H*W - e.g. [1, 64, 30, 53]
         # value: 1*num_objects*C*H*W
         # objects contain a list of object indices
         if self.H is None:
@@ -248,14 +255,15 @@ class MemoryManager:
             elif n == 0:
                 return 
             track_ids = self.track_ids + [self.track_offset + i for i in range(n)]
+        track_ids = [t for t in track_ids if t >= 0]
+        new = set(track_ids) - set(self.track_ids)
+        if new:
+            log.debug('track IDs: %s', track_ids)
+            log.info(f'new tracks: {list(new)} - added {len(new)}. {len(track_ids)} total.')
+
         self.track_ids = track_ids
         self.track_offset = max(max(self.track_ids) + 1, self.track_offset)
         
-        new = set(track_ids) - set(self.track_ids)
-        if new:
-            log.info(f'new tracks: {list(new)} - added {len(new)}. {len(track_ids)} total.')
-            log.debug('track IDs: %s', track_ids)
-
         # create new hidden states in case we added new object tracks
         if key is not None:
             self.resize_hidden_state(key)
@@ -266,14 +274,20 @@ class MemoryManager:
         track_kw = {
             'n_init': self.config['tentative_frames'],
             'max_age': self.config['max_age'],
+            'tentative_age': self.config['tentative_age'],
             **kw
         }
 
-        _, deleted = self.Track.update_tracks(self.tracks, input_track_ids, timestamp, **track_kw)
+        confirmed = {t for t in self.tracks if self.tracks[t].is_confirmed()}
+        _, deleted = self.Track.update_tracks(
+            self.tracks, input_track_ids, timestamp, 
+            delete_dict=False, **track_kw)
+        if confirmed & deleted:
+            log.info(f'deleted confirmed tracks: {confirmed & deleted}')
+        if deleted:
+            log.debug(f'deleted tracks: {deleted}')
         for tid in deleted:
             self.delete_track(tid)
-        if deleted:
-            log.info(f'deleted tracks: {deleted}')
         return deleted
 
     # ------------------- Memory compression and consolidation ------------------- #

@@ -33,14 +33,53 @@ xmem_config = {
     'enable_long_term': True,
     'enable_long_term_count_usage': True,
     'num_prototypes': 64,
-    'min_mid_term_frames': 6,
-    'max_mid_term_frames': 12,
+    'min_mid_term_frames': 3,
+    'max_mid_term_frames': 6,
     'max_long_term_elements': 1000,
     # 'dilate_size_threshold': 0.01,
     'tentative_frames': 3,
     'max_age': 60 * 30,
 }
 
+
+def nms(boxes, scores, iou_threshold, verbose=False):
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+    area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
+    # Sort boxes by their confidence scores in descending order
+    indices = np.argsort(area)[::-1]
+    boxes = boxes[indices]
+    scores = scores[indices]
+
+    selected_indices = []
+    overlap_indices = []
+    while len(boxes) > 0:
+        # Pick the box with the highest confidence score
+        b = boxes[0]
+        selected_indices.append(indices[0])
+
+        # Calculate IoU between the picked box and the remaining boxes
+        intersection_area = (
+            np.maximum(0, np.minimum(b[2], boxes[1:, 2]) - np.maximum(b[0], boxes[1:, 0])) * 
+            np.maximum(0, np.minimum(b[3], boxes[1:, 3]) - np.maximum(b[1], boxes[1:, 1]))
+        )
+        # smaller_box_area = np.minimum(
+        #     (b[2] - b[0]) * (b[3] - b[1]),
+        #     (boxes[1:, 2] - boxes[1:, 0]) * (boxes[1:, 3] - boxes[1:, 1])
+        # )
+        smaller_box_area = np.minimum(area[0], area[1:])
+        iou = intersection_area / (smaller_box_area + 1e-7)
+
+        # Filter out boxes with IoU above the threshold
+        overlap_indices.append(indices[np.where(iou > iou_threshold)[0]])
+        filtered_indices = np.where(iou <= iou_threshold)[0]
+        indices = indices[filtered_indices + 1]
+        boxes = boxes[filtered_indices + 1]
+        scores = scores[filtered_indices + 1]
+        area = area[filtered_indices + 1]
+
+    return selected_indices, overlap_indices
 
 
 
@@ -50,8 +89,12 @@ import ipdb
 def mainx(*a, **kw):
     return main(*a, **kw)
 
-def main(src, vocab='lvis', untracked_vocab=None, out_path=None, detect_every=1, skip_frames=0, fps_down=1, size=480, limit=None):
-    out_path = out_path or f'xmem_{os.path.basename(src)}'
+def main(
+        src, vocab='lvis', untracked_vocab=None, out_path=None, 
+        detect_every=1, skip_frames=0, stop_detecting_after=None,
+        fps_down=1, size=420, nms_threshold=0.1,
+        limit=None, out_dir='movies', out_prefix='xmem_', track_videos=True):
+    out_path = out_path or f'{out_dir}/{out_prefix}{os.path.basename(src)}'
     if untracked_vocab:
         vocab = vocab + untracked_vocab
     
@@ -72,6 +115,7 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path=None, detect_every=1,
     video_info, WH = get_video_info(src, size, fps_down, ncols=2)
     afps = video_info.fps / fps_down
     i_detect = int(detect_every*video_info.og_fps//fps_down) or 1
+    i_stop_detecting = int(stop_detecting_after*video_info.og_fps//fps_down) or 1 if stop_detecting_after else None
     print('detecting every', i_detect, detect_every, afps, detect_every%(1/afps))
     detect_out_frame = None 
     
@@ -84,14 +128,26 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path=None, detect_every=1,
 
             # run detic
             detections = det_mask = None
-            if detect_out_frame is None or not i % i_detect:
+            if detect_out_frame is None or not i % i_detect and (not i_stop_detecting or i < i_stop_detecting):
                 # get object detections
                 outputs = detic_model(frame)
-                det_mask = outputs["instances"].pred_masks.int()
+                det_mask = det_masks = outputs["instances"].pred_masks.int()
+                detections, det_labels = draw.prepare_detectron2_detections(outputs, detic_model.labels)
+
+                if nms_threshold:
+                    selected_indices, overlap_indices = nms(detections.xyxy, detections.confidence, nms_threshold)
+                    det_mask = det_masks[selected_indices]
+                    # for idx, idxs in enumerate(overlap_indices):
+                    #     if len(idxs):
+                    #         det_mask[idx] = torch.maximum(det_mask[idx], det_masks[idxs].max(0).values)
+                    detections = detections[selected_indices]
 
                 # draw detic
-                detect_out_frame, detections = draw.draw_detectron2(frame, outputs, detic_model.labels)
+                # detect_out_frame, detections = draw.draw_detectron2(frame, outputs, detic_model.labels)
+                detect_out_frame = draw.draw_detectron2_detections(frame, detections, det_labels)
                 log.info(f'Detected ({i}|{i_detect}): {detic_model.labels[detections.class_id]}')
+
+                
 
                 if untracked_vocab:
                     keep = np.array([l not in untracked_vocab for l in detic_model.labels[detections.class_id]], dtype=bool)
@@ -102,6 +158,9 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path=None, detect_every=1,
 
             # run xmem
             pred_mask, track_ids, input_track_ids = xmem(frame, det_mask, only_confirmed=True)
+            # if len(track_ids) > 1:
+            #         from IPython import embed
+            #         embed()
 
             # update label counts
             if detections is not None:
@@ -113,7 +172,8 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path=None, detect_every=1,
             track_out_frame, detections = draw.draw_tracks(frame, pred_mask, label_counts, track_ids, detic_model.labels)
             
             # write videos for each track
-            tw.write_tracks(frame, detections)
+            if track_videos:
+                tw.write_tracks(frame, detections)
 
             # write frame to file
             s.write_frame(np.concatenate([track_out_frame, detect_out_frame], axis=1))
