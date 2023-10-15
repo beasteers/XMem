@@ -4,6 +4,10 @@ from scipy.optimize import linear_sum_assignment
 from torchvision.ops import masks_to_boxes
 from IPython import embed
 
+import logging
+log = logging.getLogger(__name__)
+
+
 def mask_pred_to_binary(x):
     idxs = torch.argmax(x, dim=0)
     y = torch.zeros_like(x)
@@ -160,11 +164,9 @@ def assign_masks(
     if label_cost is not None:
         print(np.round(label_cost.cpu(), 2))
     # center_cost = box_center_dist(tboxes, nboxes).cpu().numpy()
-    print('m\n', np.round(cost, 2))
-    print('a\n', np.round(ioa_cost, 2))
-    print('b\n', np.round(iou_cost, 2))
-    # print('c', center_cost)
-    # input()
+    log.debug(f"mask cost: {np.round(cost, 2)}")
+    log.debug(f"ioa cost: {np.round(ioa_cost, 2)}")
+    log.debug(f"iou cost: {np.round(iou_cost, 2)}")
     
     rows, cols = linear_sum_assignment(cost, maximize=True)
     xcost = cost[rows, cols]
@@ -202,8 +204,7 @@ def assign_masks(
         keep = cols >= 0
         rows = rows[keep]
         cols = cols[keep]
-    # print(rows, cols)
-    # if input():embed()
+
     return combine_masks(pred_masks, new_masks, rows, cols, **kw)
 
 
