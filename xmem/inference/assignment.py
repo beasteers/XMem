@@ -162,7 +162,7 @@ def assign_masks(
     ioa_cost = ioa_cost.cpu().numpy()
     iou_cost = iou_cost.cpu().numpy()
     if label_cost is not None:
-        print(np.round(label_cost.cpu(), 2))
+        log.debug(f"label cost: {np.round(label_cost.cpu(), 2)}")
     # center_cost = box_center_dist(tboxes, nboxes).cpu().numpy()
     log.debug(f"mask cost: {np.round(cost, 2)}")
     log.debug(f"ioa cost: {np.round(ioa_cost, 2)}")
