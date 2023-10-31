@@ -188,14 +188,15 @@ class XMem(torch.nn.Module):
         self.curr_it += 1
         return pred_mask, track_ids, input_track_ids
     
-    def assign_masks(self, pred_prob_with_bg, mask, label_cost=None, track_det_mask=None):
+    def assign_masks(self, pred_prob_with_bg, mask, label_cost=None, track_det_mask=None, **kw):
         mask, input_track_ids, unmatched_rows, new_rows = assign_masks(
             pred_prob_with_bg, mask, 
             label_cost=label_cost, 
             track_det_mask=track_det_mask,
             min_iou=self.config['min_iou'],
             allow_create=self.config['allow_create'],
-            join_method=self.config['mask_join_method'])
+            join_method=self.config['mask_join_method'], 
+            **kw)
         return mask, input_track_ids, unmatched_rows, new_rows
 
     # -------------------------------- Conditions -------------------------------- #
@@ -277,7 +278,14 @@ class XMem(torch.nn.Module):
             self.memory.set_hidden(hidden)
         return pred_prob_with_bg
 
-    def _match_detection_masks(self, mask, pred_prob_with_bg, valid_track_ids=None, mask_scores=None, tracked_labels=None, key=None):
+    def _match_detection_masks(
+            self, mask, pred_prob_with_bg, 
+            valid_track_ids=None, 
+            mask_labels=None, 
+            mask_scores=None, 
+            tracked_labels=None, 
+            key=None
+        ):
         '''Match object detections with minimum IoU'''
         input_track_ids = valid_track_ids
         if valid_track_ids is None:
@@ -289,16 +297,25 @@ class XMem(torch.nn.Module):
                 # get NT x ND label similarity and ND bool mask of which detections are worth tracking
                 label_cost = None
                 track_det_mask = None
+                track_labels = None
                 if mask_scores is not None:
+                    assert tracked_labels is not None, "If using mask_scores, you need to specify tracked_labels"
                     xs = [
                         self.memory.tracks[i].compare_class_distribution(mask_scores)
                         for i in self.memory.track_ids
                     ]
                     label_cost = torch.stack(xs)
                     track_det_mask = (mask_scores[:, tracked_labels] > self.tracked_conf_threshold).any(1).cpu().numpy()
-
+                if mask_labels is not None:
+                    track_labels = np.array([self.memory.tracks[i].pred_label for i in self.memory.track_ids])
+                    # label_det_cost = #mask_labels[None], track_labels[:, None]
+                    
                 mask, input_track_ids, unmatched_rows, new_rows = self.assign_masks(
-                    pred_prob_with_bg, mask, label_cost=label_cost, track_det_mask=track_det_mask)
+                    pred_prob_with_bg, mask, 
+                    label_cost=label_cost, 
+                    mask_labels=mask_labels,
+                    track_labels=track_labels,
+                    track_det_mask=track_det_mask)
                 if len(new_rows):
                     # print("unmatched/new rows", unmatched_rows, new_rows, len(mask))
                     self.memory.update_track_ids(len(mask), key)

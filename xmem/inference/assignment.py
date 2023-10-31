@@ -125,8 +125,15 @@ def masks_to_boxes2(masks: torch.Tensor) -> torch.Tensor:
 def assign_masks(
         pred_prob_with_bg, new_masks, 
         label_cost=None, track_det_mask=None, 
-        min_iou=0.4, min_box_iou=0.8, min_box_ioa=0.98, 
-        max_center_dist=0.3, min_box_center_ioa=0.2, min_label_cost=0.5, **kw
+        mask_labels=None, track_labels=None,
+        min_iou=0.4, 
+        min_label_match_iou=0.1,
+        min_box_iou=0.8, 
+        min_box_ioa=0.98, 
+        max_center_dist=0.3, 
+        min_box_center_ioa=0.2, 
+        min_label_cost=0.5, 
+        **kw
     ):
     '''Assign XMem predicted masks to user-provided masks.
     
@@ -173,10 +180,15 @@ def assign_masks(
     xiou_cost = iou_cost[rows, cols]
     xioa_cost = ioa_cost[rows, cols]
     # xcenter_cost = center_cost[rows, cols]
+    if mask_labels is not None:
+        assert track_labels is not None, "If specifying mask_labels, also provide the track labels"
+        # Calculate IoU based on label equality
+        label_equal = (mask_labels[None] == track_labels[:, None])
+        min_iou = np.where(label_equal, min_label_match_iou, min_iou)
+
     keep = (
         # has a high enough segmentation match
         (xcost > min_iou)
-        
     )
     weak_keep = (
         # has high enough box match

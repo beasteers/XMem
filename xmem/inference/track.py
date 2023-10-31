@@ -45,6 +45,11 @@ class Track:
     def __str__(self):
         return f'Track({self.first_seen}-{self.last_seen}, {self.label_count})'
 
+    @property
+    def pred_label(self):
+        xs = self.label_count.most_common(1)
+        return xs[0][0] if xs else None
+
     # --------------------------- Collection Management -------------------------- #
 
     @classmethod
