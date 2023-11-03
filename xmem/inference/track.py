@@ -166,7 +166,7 @@ class Track:
         # print('b,', self.class_distribution[tracked_labels] > tracked_conf_threshold, self.class_distribution[tracked_labels])
         return (self.class_distribution[tracked_labels] > tracked_conf_threshold).any(0)
     
-    def missed_class_distribution(self, factor=0.25):
+    def missed_class_distribution(self, factor=0.15):
         self.class_distribution = self.class_distribution ** (1 + factor)
 
     # def update_distribution(self, topk_classes, topk_scores):
