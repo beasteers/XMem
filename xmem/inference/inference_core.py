@@ -1,3 +1,4 @@
+from __future__ import annotations
 import cv2
 import numpy as np
 import torch
@@ -28,7 +29,8 @@ device = (
 )
 
 class XMem(torch.nn.Module):
-    def __init__(self, config, checkpoint_path=None, map_location=device, model=None, Track=Track):
+    Track = Track
+    def __init__(self, config, checkpoint_path=None, map_location=device, model=None, Track=None):
         super().__init__()
         config = get_config(config)
         if model is None:
@@ -41,7 +43,8 @@ class XMem(torch.nn.Module):
         self._device_param = torch.nn.Parameter(torch.empty(0))
 
         # box tracks
-        self.Track = Track
+        if Track is not None:
+            self.Track = Track
 
         self._set_config(config)
         self.clear_memory()
@@ -52,6 +55,7 @@ class XMem(torch.nn.Module):
         self.last_mem_it = 0
         if not self._deep_update_sync:
             self.last_deep_update_it = -self._deep_update_every
+        self.tracked_conf_threshold = 0.5
         
         track_offset = 0
         if not reset_index and hasattr(self, 'memory'):
@@ -81,7 +85,7 @@ class XMem(torch.nn.Module):
     def track_ids(self) -> list[str]:
         return self.memory.track_ids
 
-    def forward(self, image, mask=None, input_track_ids=None, no_update=False, binarize_mask=True, only_confirmed=False):
+    def forward(self, image, mask=None, input_track_ids=None, mask_scores=None, tracked_labels=None, negative_mask=None, *, no_update=False, binarize_mask=True, only_confirmed=False):
         '''Track object segmentations. This should be called on sequential frames. To reset memory, do `model.clear_memory()`
 
         Arguments:
@@ -106,6 +110,7 @@ class XMem(torch.nn.Module):
 
         # exit early if there is nothing to track
         if self._is_inactive(mask):
+            log.debug("Nothing for xmem to track...")
             return self._empty_detections(image, mask, binarize_mask=binarize_mask)
 
         # -------------------------- check memory conditions ------------------------- #
@@ -133,12 +138,20 @@ class XMem(torch.nn.Module):
         valid_track_ids = input_track_ids
         if mask is not None:
             mask = F.pad(mask, pad)
+            if not torch.is_floating_point(mask):
+                mask = mask.int()
 
             # match object detections with minimum IoU
             mask, input_track_ids = self._match_detection_masks(
-                mask, pred_prob_with_bg, valid_track_ids, key)
-            mask, pred_prob_with_bg = self._valid_mask_predictions(
-                mask, pred_prob_with_bg, valid_track_ids)
+                mask, pred_prob_with_bg, valid_track_ids, 
+                mask_scores=mask_scores,
+                tracked_labels=tracked_labels,
+                key=key)
+
+        if negative_mask is not None:
+            negative_mask = F.pad(negative_mask, pad)
+        pred_prob_with_bg = self._finalize_mask_predictions(
+            mask, pred_prob_with_bg, valid_track_ids, negative_mask)
 
         # ------------------------- update memory and outputs ------------------------ #
 
@@ -156,7 +169,10 @@ class XMem(torch.nn.Module):
 
         # handle track additions and deletions
         if input_track_ids is not None:
-            pred_mask, track_ids = self._update_tracks(pred_mask, track_ids, input_track_ids)
+            pred_mask, track_ids = self._update_tracks(
+                pred_mask, track_ids, input_track_ids, 
+                mask_scores=mask_scores, 
+                tracked_labels=tracked_labels)
 
         # ---------------------------- postprocess outputs --------------------------- #
 
@@ -172,11 +188,15 @@ class XMem(torch.nn.Module):
         self.curr_it += 1
         return pred_mask, track_ids, input_track_ids
     
-    def assign_masks(self, pred_prob_with_bg, mask):
+    def assign_masks(self, pred_prob_with_bg, mask, label_cost=None, track_det_mask=None, **kw):
         mask, input_track_ids, unmatched_rows, new_rows = assign_masks(
-            pred_prob_with_bg, mask,
-            self.config['min_iou'],
-            self.config['allow_create'])
+            pred_prob_with_bg, mask, 
+            label_cost=label_cost, 
+            track_det_mask=track_det_mask,
+            min_iou=self.config['min_iou'],
+            allow_create=self.config['allow_create'],
+            join_method=self.config['mask_join_method'], 
+            **kw)
         return mask, input_track_ids, unmatched_rows, new_rows
 
     # -------------------------------- Conditions -------------------------------- #
@@ -258,7 +278,14 @@ class XMem(torch.nn.Module):
             self.memory.set_hidden(hidden)
         return pred_prob_with_bg
 
-    def _match_detection_masks(self, mask, pred_prob_with_bg, valid_track_ids=None, key=None):
+    def _match_detection_masks(
+            self, mask, pred_prob_with_bg, 
+            valid_track_ids=None, 
+            mask_labels=None, 
+            mask_scores=None, 
+            tracked_labels=None, 
+            key=None
+        ):
         '''Match object detections with minimum IoU'''
         input_track_ids = valid_track_ids
         if valid_track_ids is None:
@@ -267,20 +294,50 @@ class XMem(torch.nn.Module):
                 self.memory.update_track_ids(len(mask), key)
                 input_track_ids = self.memory.track_ids
             else:
+                # get NT x ND label similarity and ND bool mask of which detections are worth tracking
+                label_cost = None
+                track_det_mask = None
+                track_labels = None
+                if mask_scores is not None:
+                    assert tracked_labels is not None, "If using mask_scores, you need to specify tracked_labels"
+                    xs = [
+                        self.memory.tracks[i].compare_class_distribution(mask_scores)
+                        for i in self.memory.track_ids
+                    ]
+                    label_cost = torch.stack(xs)
+                    track_det_mask = (mask_scores[:, tracked_labels] > self.tracked_conf_threshold).any(1).cpu().numpy()
+                if mask_labels is not None:
+                    track_labels = np.array([self.memory.tracks[i].pred_label for i in self.memory.track_ids])
+                    # label_det_cost = #mask_labels[None], track_labels[:, None]
+                    
                 mask, input_track_ids, unmatched_rows, new_rows = self.assign_masks(
-                    pred_prob_with_bg, mask)
+                    pred_prob_with_bg, mask, 
+                    label_cost=label_cost, 
+                    mask_labels=mask_labels,
+                    track_labels=track_labels,
+                    track_det_mask=track_det_mask)
                 if len(new_rows):
                     # print("unmatched/new rows", unmatched_rows, new_rows, len(mask))
                     self.memory.update_track_ids(len(mask), key)
                 track_ids = self.memory.track_ids
-                input_track_ids = [track_ids[i] for i in input_track_ids]
+                input_track_ids = [track_ids[i] if i >= 0 else -1 for i in input_track_ids]
+
+                # update NT 
+                if mask_scores is not None:
+                    input_track_ids_x = input_track_ids
+                    input_track_ids = np.ones(len(track_det_mask), dtype=int) * -1
+                    input_track_ids[track_det_mask] = input_track_ids_x
 
         assert (mask is None) == (input_track_ids is None)
         return mask, input_track_ids
     
-    def _valid_mask_predictions(self, mask, pred_prob_with_bg, valid_track_ids):
+    def _finalize_mask_predictions(self, mask, pred_prob_with_bg, valid_track_ids, negative_mask=None):
         '''Combine predicted and detected masks.'''
-        if pred_prob_with_bg is not None:
+        if mask is None:
+            if negative_mask is None:
+                return pred_prob_with_bg
+            mask = pred_prob_with_bg[1:]
+        elif pred_prob_with_bg is not None:
             pred_prob_no_bg = pred_prob_with_bg[1:]
             # convert all masks overlapping with ground truth mask to zero
             pred_prob_no_bg[:, (mask.sum(0) > 0.5)] = 0
@@ -293,9 +350,11 @@ class XMem(torch.nn.Module):
                 ]
                 # non-labelled objects are copied from the predicted mask
                 mask[shift_by_one_non_labels] = pred_prob_no_bg[shift_by_one_non_labels]
+        if negative_mask is not None:
+            mask[:, negative_mask > 0.5] = 0
         # add background back in and convert using softmax
         pred_prob_with_bg = aggregate(mask, dim=0)
-        return mask, pred_prob_with_bg
+        return pred_prob_with_bg
     
     def _update_memory(self, image, key, shrinkage, selection, multi_scale_features, pred_prob_with_bg, is_deep_update):
         '''Add features to memory and possibly do a full update hidden state.'''
@@ -320,14 +379,36 @@ class XMem(torch.nn.Module):
 
         log.debug("%s memory update %s: \n%s", 'deep' if is_deep_update else 'normal', self.curr_it, self.memory)
 
-    def _update_tracks(self, pred_mask, track_ids, input_track_ids):
+    def _update_tracks(self, pred_mask, track_ids, input_track_ids, mask_scores=None, tracked_labels=None):
         '''Bookkeeping track detections'''
         track_ids = np.asarray(track_ids)
         deleted = self.memory.update_tracks(input_track_ids, self.curr_it)
-        keep = np.array([True]+[i not in deleted for i in track_ids])
+        input_track_ids = self.update_track_scores(pred_mask, track_ids, input_track_ids, mask_scores, tracked_labels)
+        keep = np.array([True]+[i >= 0 and i in self.track_ids for i in track_ids])
         pred_mask = pred_mask[keep]
         track_ids = track_ids[keep[1:]]
         return pred_mask, track_ids
+    
+    def update_track_scores(self, pred_mask, track_ids, input_track_ids, mask_scores=None, tracked_labels=None):
+        if mask_scores is not None:
+            # for tracks that have matching detections
+            for ti, s in zip(input_track_ids, mask_scores):
+                if ti >= 0 and ti in self.track_ids:
+                    self.memory.tracks[ti].update_class_distribution(s)
+
+            not_empty = pred_mask.sum(1).sum(1) > 0
+            not_detected = ~np.isin(track_ids, input_track_ids)
+            for tid, ne, nd in zip(track_ids, not_empty, not_detected):
+                if ne and nd and tid in self.memory.tracks:
+                    self.memory.tracks[tid].missed_class_distribution()
+
+            # for all tracks
+            for ti in list(self.memory.track_ids):
+                # check if track is still considered a class of interest
+                if not self.memory.tracks[ti].check_class_distribution(tracked_labels, self.tracked_conf_threshold):
+                    self.memory.delete_track(ti)
+                    input_track_ids[input_track_ids == ti] = -1
+        return input_track_ids
 
     def _binarize_mask(self, pred_mask, track_ids):
         '''Convert logits to argmax binary mask.'''

@@ -127,6 +127,8 @@ class KeyValueMemoryStore:
                 self.life_counts[gi] = splice(self.life_counts[gi], start, end)
 
     def remove_obsolete_features(self, max_size: int):
+        if max_size >= self.size:
+            return
         # get topk usage
         usage = self.get_usage().flatten()
         values, _ = torch.topk(usage, k=(self.size-max_size), largest=False, sorted=True)

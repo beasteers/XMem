@@ -17,8 +17,10 @@ DEFAULT_CONFIG = {
     # mask matching options
     'min_iou': 0.4,
     'allow_create': True,
+    'mask_join_method': 'replace', # min, max, mult, ignore
     # these are useful for uncertain mask detections
     'tentative_frames': 0,
+    'tentative_age': 1,
     'max_age': 0,
 }
 

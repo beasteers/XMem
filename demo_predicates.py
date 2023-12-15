@@ -26,8 +26,8 @@ device = 'cuda'
 class CustomTrack(Track):
     hoi_class_id = 0
     state_class_label = ''
-    def __init__(self, track_id, t_obs, n_init=3, max_age=None):
-        super().__init__(track_id, t_obs, n_init, max_age)
+    def __init__(self, track_id, t_obs, n_init=3, **kw):
+        super().__init__(track_id, t_obs, n_init, **kw)
         self.label_count = Counter()
         self.z_clips = {}
 
@@ -89,12 +89,15 @@ xmem_config = {
     'min_mid_term_frames': 5,
     'max_mid_term_frames': 10,
     'max_long_term_elements': 10000,
-    'dilate_size_threshold': 0#.01,
+    'dilate_size_threshold': 0, #.01,
+    'tentative_frames': 2,
+    'tentative_age': 3,
+    'min_iou': 0.2,
 }
 
 
 @torch.no_grad()
-def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_predc_output.mp4', detect_every=1, skip_frames=0, fps_down=1, size=480):
+def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_predc_output.mp4', detect_every=0.2, skip_frames=0, fps_down=1, size=480):
 
     TORTILLA = 'tortilla, white flour, circular'
     # PB_JAR = 'peanut butter jar'
@@ -117,6 +120,7 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_predc_output.mp
 
     # hand-object interactions
     egohos = EgoHos(mode='obj1', device=device)
+    egohos_classes = np.array(list(egohos.CLASSES))
 
     # few-shot classifier
     fewshot = FewShot({
@@ -143,11 +147,22 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_predc_output.mp
             frame = cv2.resize(frame, WH)
 
             detections = det_mask = None
-            hoi_masks = hoi_class_ids = None
+            hoi_masks = hoi_class_ids = hand_masks = None
+
+            # get hoi detections
+            hoi_masks, hoi_class_ids = egohos(frame)
+            hos_out_frame, hos_detections = draw.draw_egohos(frame, hoi_masks, hoi_class_ids, egohos)
+            hand_masks = hoi_masks[(hoi_class_ids == 1) | (hoi_class_ids == 2)].sum(0)
+
             if not i % i_detect or detect_out_frame is None:
                 # get object detections
                 outputs = detic(frame)
+                nms_indices = asymmetric_nms(
+                    outputs['instances'].pred_boxes.tensor.cpu().numpy(), 
+                    outputs['instances'].scores.cpu().numpy())
+                outputs['instances'] = outputs['instances'][nms_indices]
                 det_mask = outputs["instances"].pred_masks.int()
+
                 detect_out_frame, detections = draw.draw_detectron2(frame, outputs, detic.labels)
 
                 # filter out objects we want to detect but not track (for disambiguation)
@@ -156,14 +171,10 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_predc_output.mp
                     det_mask = det_mask[keep]
                     detections = detections[keep]
 
-                # get hoi detections
-                hoi_masks, hoi_class_ids = egohos(frame)
-                hos_out_frame, hos_detections = draw.draw_egohos(frame, hoi_masks, hoi_class_ids, egohos)
-
                 tqdm.tqdm.write(f'{len(detections)} {len(hos_detections)} {len(xmem.track_ids)}')
 
             # run xmem
-            pred_mask, track_ids, input_track_ids = xmem(frame, det_mask)
+            pred_mask, track_ids, input_track_ids = xmem(frame, det_mask, negative_mask=hand_masks)
             pred_boxes = masks_to_boxes(pred_mask)
 
             # update label counts
@@ -206,14 +217,46 @@ def main(src, vocab='lvis', untracked_vocab=None, out_path='xmem_predc_output.mp
                 track_ids, 
                 xmem, detic, egohos)
 
+            hand_masks=np.stack([hand_masks.cpu().numpy()*255]*3, axis=-1).astype(np.uint8)
             # write frame to file
             x = np.concatenate([
-                np.concatenate([full_out_frame, track_out_frame], axis=1),
+                np.concatenate([hand_masks, track_out_frame], axis=1),
                 np.concatenate([detect_out_frame, hos_out_frame], axis=1),
             ], axis=0)
             s.write_frame(x)
 
 
+
+def asymmetric_nms(boxes, scores, iou_threshold=0.7):
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+
+    # Sort boxes by their confidence scores in descending order
+    indices = np.argsort(scores)[::-1]
+    boxes = boxes[indices]
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
+    selected_indices = []
+    while len(boxes) > 0:
+        # Pick the box with the highest confidence score
+        b = boxes[0]
+        selected_indices.append(indices[0])
+
+        # Calculate IoU between the picked box and the remaining boxes
+        intersection_area = (
+            np.maximum(0, np.minimum(b[2], boxes[1:, 2]) - np.maximum(b[0], boxes[1:, 0])) * 
+            np.maximum(0, np.minimum(b[3], boxes[1:, 3]) - np.maximum(b[1], boxes[1:, 1]))
+        )
+        smaller_box_area = np.minimum(areas[0], areas[1:])
+        iou = intersection_area / (smaller_box_area + 1e-7)
+
+        # Filter out boxes with IoU above the threshold
+        filtered_indices = np.where(iou <= iou_threshold)[0]
+        indices = indices[filtered_indices + 1]
+        boxes = boxes[filtered_indices + 1]
+        areas = areas[filtered_indices + 1]
+
+    return selected_indices
 
 
 class Drawer:
